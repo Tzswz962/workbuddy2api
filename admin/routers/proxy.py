@@ -1389,7 +1389,8 @@ def _select_account(db: Session, exclude_ids: set | None = None,
     该账号对该 model 没有处于模型级冷却（6004/11102）、在途未占满。
 
     选号策略（`ADMIN_ACCOUNT_SELECT`）：
-      * `remain`   余额最多优先（原行为，确定性）
+      * `oldest`   最老录入优先（**默认**）—— 先用完老账号额度，避免积分过期作废
+      * `remain`   余额最多优先（确定性）
       * `lru`      最久未用优先（确定性）
       * `weighted` 三因子加权随机（余额占比 ×10 + 快过期积分占比 ×8 + 闲置补偿），
                    Top-5 短名单内抽签 —— 概率倾斜而非硬排序，流量摊得更开
@@ -1459,7 +1460,22 @@ def _select_account(db: Session, exclude_ids: set | None = None,
 
     # -- 第三层：按策略选择 ----------------------------------------------
     acc: Account | None = None
-    if settings.ACCOUNT_SELECT == "weighted":
+    if settings.ACCOUNT_SELECT == "oldest":
+        # 最老录入优先：**先用完老账号的额度**。
+        #
+        # 为什么这是对的：官方赠送/任务获得的积分**会过期作废**，
+        # 老账号攒的积分离到期最近 —— 如果一直从新号开始用，
+        # 老号的积分就会白白过期（用户原话：「积分都快过期了为啥不先用」）。
+        #
+        # 次级键用 last_used_at 升序（最久未用的先走），
+        # 避免同一个老号被连续打满；再兜底按 id 升序保证顺序稳定。
+        pool_rows.sort(key=lambda a: (
+            a.created_at or datetime.min,
+            a.last_used_at or datetime.min,
+            a.id,
+        ))
+        acc = pool_rows[0]
+    elif settings.ACCOUNT_SELECT == "weighted":
         canon = [
             {"uid": a.uid or "", "credits": int(a.balance_remain or 0),
              "credits_expiring": int(a.credits_expiring or 0),
@@ -1473,7 +1489,7 @@ def _select_account(db: Session, exclude_ids: set | None = None,
         pool_rows.sort(key=lambda a: a.last_used_at or datetime.min)
         acc = pool_rows[0]
     else:
-        # remain（默认）：余额最多优先。
+        # remain：余额最多优先。
         # 在 Python 侧排序是因为上面已做过内存过滤（在途占满 / 模型级冷却），
         # 再回数据库 order_by 会丢掉这些过滤结果。reverse=True 配正数 key。
         pool_rows.sort(key=lambda a: int(a.balance_remain or 0), reverse=True)

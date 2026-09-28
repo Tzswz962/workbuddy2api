@@ -24,7 +24,7 @@ from admin.security import require_admin
 # ⚠️ 必须整组挂 require_admin（安全审计「严重」项）。
 # 历史实现的这个 router **一个鉴权依赖都没有**，于是：
 #   * `/api/growth/accounts/{id}/tasks` 可以被匿名者从 id=1 递增枚举，
-#     直接拿到全部账号的 uid 与**显示名**（实测泄露 18022387641 这类手机号）；
+#     直接拿到全部账号的 uid 与**显示名**（实测泄露 180****7641 这类手机号）；
 #   * `/api/growth/run-async`、`/run`、`/accept`、`/claim` 可以被匿名者直接调用，
 #     在服务器上启动批量任务、真实消耗账号额度并写库 —— 不只是信息泄露，
 #     是**有副作用**的未授权操作。
@@ -35,6 +35,21 @@ router = APIRouter(prefix="/api/growth", tags=["growth"],
 #: 任务定义缓存 {"tasks": [...], "synced_at": iso}
 _task_cache: dict = {}
 
+#: 单账号任务列表的短缓存（秒）。
+#: 上游拉一次任务列表实测 1~3.3 秒，而前端「执行完 / 领奖完」都会立刻再拉一次；
+#: 缓存一个很短的窗口能让连续刷新**秒回**，又不会让状态明显过时。
+_ACCT_TASKS_TTL = 3.0
+_acct_tasks_cache: dict = {}
+
+
+def _invalidate_acct_tasks(account_ids) -> None:
+    """清掉这些账号的任务缓存（做完任务 / 领完奖后必须调）。
+
+    否则前端紧接着的刷新会拿到**旧的**状态，用户看到「刚做完却还显示未完成」。
+    """
+    for aid in (account_ids or []):
+        _acct_tasks_cache.pop(aid, None)
+
 #: 执行节流（秒）
 _EVENT_GAP = 1.2          # 同一任务内两次触发之间
 _ACCOUNT_GAP = 1.0        # 两个账号之间
@@ -44,14 +59,46 @@ _ACCOUNT_GAP = 1.0        # 两个账号之间
 _POLL_INTERVAL = 0.5      # 轮询间隔
 _ACCEPT_TIMEOUT = 6.0     # 等 accept 参与状态落库
 _VERIFY_TIMEOUT = 6.0     # 等触发后进度落库
+#: 等「任务变成可领取」的上限（秒）。
+#: 上游把任务标成 completed 有延迟，跑完立刻查经常还是 in_progress ——
+#: 这正是以前「做完了但没自动领、要手动再点」的根因。
+#: 一旦查到可领取就立刻领（不等满这个时长）。
+_CLAIM_WAIT = 8.0
 
 _MAX_TIMES = 10           # 单任务最多触发次数上限
 
 #: 单个账号的总时间预算（秒）。
-#: 上游慢或某任务一直不达标时，各阶段的超时虽然都有上限，但会累加：
-#: 4 个任务 × (accept 6s + 触发 N×1.2s + 复查 6s) 就可能到几分钟。
-#: 一个异常账号足以让整个批量看起来「卡住不动」，所以再加一道账号级兜底。
-_ACCOUNT_BUDGET = 45.0
+#:
+#: 实测（15 个可自动化任务、上游每次约 3s）跑完一个账号要约 310s：
+#:   chat_5 / expert_5 / template_5 这类 MULTI 任务本身就要触发 5 次，
+#:   每次「触发 + 间隔」约 4.2s，单个任务就 20s+。
+#: 原来给 45s —— 结果必然在做完 2~3 个任务后就报「本账号超时，剩余任务留待下次」，
+#: 用户得反复点好几次才能做完，这就是体感上的「老是超时」。
+#:
+#: 现在给 300s（5 分钟）：
+#:   * 够跑完一个账号的全部可自动化任务；
+#:   * 仍保留上限，异常账号不会无限拖住整个批量（这是当初加预算的目的）；
+#:   * 定时任务/异步任务走后台线程，不受 HTTP 超时约束，长一点没问题。
+#:     同步接口（后台「执行」按钮）如果账号多，仍建议用 run-async。
+_ACCOUNT_BUDGET = 300.0
+
+#: 同步执行时的软预算：超过就**停止接新任务**（但不打断当前任务）。
+#:
+#: 与 `_ACCOUNT_BUDGET` 的区别：那个是「单账号硬上限」，这个是给
+#: 同步接口的「别让整个请求超过 nginx 60s」用的。异步/定时任务不受它限制。
+_SYNC_SOFT_BUDGET = 50.0
+
+#: 定时任务整批的预算（秒）。
+#:
+#: 为什么必须有：定时任务是**在调度线程里同步跑**的，跑多久就占多久。
+#: 23 个账号 × 单账号最长 300s，最坏能把调度线程占住 1 个多小时 ——
+#: 期间整点刷新余额、签到、token 保活**全都不会执行**。
+#: 这就是「定时任务会不会卡住」的答案：会，而且卡的是整个调度器。
+#:
+#: 25 分钟足够跑完「少数账号有新任务」的日常情况
+#: （已完成的老号走快速通道，每个约 1 秒，不占时间）。
+#: 跑不完的账号如实记录「留待下次」，第二天继续。
+_SCHEDULE_SOFT_BUDGET = 1500.0
 
 #: 触发事件时优先使用的免费模型（0 倍率），用完再退回低倍率
 _PREFERRED_MODELS = ["hy3", "hunyuan-chat"]
@@ -228,8 +275,35 @@ def _updated(session, acc: Account) -> str:
         return acc.auth_json
 
 
+#: 等「first_buddy 解锁完成」的上限（秒）。
+#: 补完门槛对话后，上游需要一点时间才让其它任务可参与；
+#: 太早进入任务循环会白跑一整轮（实测 id=47 的 14 个任务全被前置条件拦下）。
+_GATE_UNLOCK_WAIT = 12.0
+
+
+def _gate_unlocked(session) -> bool:
+    """`first_buddy` 是否已达标（completed/claimed）。异常一律当「未达」。"""
+    try:
+        for t in session.growth_tasks():
+            if t.get("task_code") == "first_buddy":
+                return t.get("accept_status") in ("completed", "claimed")
+    except Exception:
+        pass
+    return False
+
+
+def _reload_after_gate(session, before: list) -> list:
+    """门槛处理之后重新拉任务列表；失败则退回旧列表（不要因为网络抖动就崩）。"""
+    try:
+        return session.growth_tasks()
+    except Exception:
+        return before
+
+
 def run_accounts(account_ids: list[int], task_codes: list[str] | None,
-                 db: Session, on_done=None, on_beat=None) -> dict:
+                 db: Session, on_done=None, on_beat=None,
+                 soft_budget: float | None = None,
+                 on_task=None) -> dict:
     """对一批账号执行「自动参与 + 触发完成 + 领取」。供接口与定时任务共用。
 
     这里沉淀了串行执行与节流逻辑，定时任务必须复用本函数，
@@ -243,10 +317,48 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
 
     Args:
         on_done: 每完成一个账号回调一次，用于上报进度（可为 None）。
+        on_beat: 处理每个账号前的心跳回调（可为 None）。
+        on_task: 每处理完一个**任务**回调一次，用于上报细粒度进度
+            （形如 `on_task(account_name, task_item)`）。一个账号要跑
+            十几个任务、耗时几分钟，只有账号级进度的话界面会长时间不动，
+            用户以为卡住了。
+        soft_budget: 整个批量的软预算（秒）。到点**停止接新账号**，
+            但不打断正在处理的账号 —— 给同步接口用，避免请求本身超时。
+            None = 不限。
     """
     model = _pick_free_model(db)
+    batch_start = time.monotonic()
+    # 统一顺序：创建时间倒序（新 → 老）。
+    # 放在这里而不是各个调用方，是为了让同步接口、异步任务、定时任务
+    # **三者顺序完全一致** —— 否则「定时任务和手动点的顺序不一样」会很难解释，
+    # 用户也会觉得「我点了新号却先从老号开始跑」。
+    account_ids = _ordered_ids(list(account_ids), db)
     out = []
+
+    def _push_task(acc_log: dict, item: dict, acc_name: str = "") -> None:
+        """记录一个任务结果，并上报细粒度进度。
+
+        统一走这里（而不是各处直接 append）是为了保证每一条都回调 on_task ——
+        漏掉某一类分支就会出现「界面停在那里不动」，而实际后端在推进。
+        """
+        acc_log["tasks"].append(item)
+        if on_task:
+            try:
+                on_task(acc_name, item)
+            except Exception:
+                pass
+
     for aid in account_ids:
+        # 软预算：整批已经跑太久了，剩下的账号直接如实标注「留待下次」，
+        # 让请求体面返回，而不是被 nginx 掐断（那样前端只会看到 504，更糟）。
+        if soft_budget is not None and (time.monotonic() - batch_start) >= soft_budget:
+            item = {"account_id": aid, "ok": False,
+                    "msg": "整批已用满本次时间预算，剩余账号留待下次"}
+            out.append(item)
+            if on_done:
+                on_done(item)
+            continue
+
         acc = db.query(Account).get(aid)
         if not acc:
             item = {"account_id": aid, "ok": False, "msg": "账号不存在"}
@@ -274,6 +386,50 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
             with backend.AccountSession(acc.auth_json) as s:
                 tasks = s.growth_tasks()
                 by_code = {t.get("task_code"): t for t in tasks}
+
+                # ── 前置门槛：first_buddy ───────────────────────────────
+                # 上游对绝大多数任务都要求先完成 first_buddy，否则 accept 直接回
+                #   {"status":"error","message":"prerequisite not met: first_buddy
+                #    (no buddy instance found)"}
+                # 而 HTTP 仍是 200 —— 不检查 status 就会被当成成功，
+                # 于是「满屏成功、实际一个没做」（本账号实测 15 个里 13 个如此）。
+                #
+                # first_buddy 的条件是「至少一次对话」，补一次就解锁。
+                # 这套逻辑本来就写在 backend._clear_buddy_gate（猫猫旅行在用），
+                # 这里复用同一实现，不要另写一份。
+                gate_state = (by_code.get("first_buddy") or {}).get("accept_status")
+                if gate_state not in ("completed", "claimed"):
+                    try:
+                        ok_gate, gate_msg = s._clear_buddy_gate()
+                        acc_log["buddy_gate"] = {"ok": ok_gate, "msg": gate_msg}
+                        _logger.info("growth: 账号 %s 前置门槛 first_buddy -> %s（%s）",
+                                     acc.name, ok_gate, gate_msg)
+                    except Exception as e:
+                        acc_log["buddy_gate"] = {"ok": False, "msg": str(e)[:160]}
+                    # 门槛处理完重新拉一次：解锁后的任务状态会变
+                    tasks = _reload_after_gate(s, tasks)
+                    by_code = {t.get("task_code"): t for t in tasks}
+
+                # ⚠️ 上面的「重新拉一次」有可能仍拿到未解锁的快照：
+                # `_clear_buddy_gate` 内部只 sleep 1.5s 就复查，而上游把
+                # first_buddy 落库并解锁其余任务是有延迟的。实测 id=47 就是
+                # 这样：first_buddy 已被标记 claimed，但紧接着对 14 个任务
+                # accept 全部回 `prerequisite not met: first_buddy` —— 白跑一轮。
+                # 所以这里再加一道「确认解锁」的轮询，确认不了才继续
+                # （宁可多等几秒，也不要白跑一整轮）。
+                if not task_codes and gate_state not in ("completed", "claimed"):
+                    unlocked = jobrunner.wait_for(
+                        lambda: _gate_unlocked(s), _GATE_UNLOCK_WAIT, _POLL_INTERVAL)
+                    if unlocked:
+                        tasks = s.growth_tasks()
+                        by_code = {t.get("task_code"): t for t in tasks}
+                        acc_log["buddy_gate"]["unlocked"] = True
+                    else:
+                        acc_log["buddy_gate"]["unlocked"] = False
+                        _logger.warning(
+                            "growth: 账号 %s 的 first_buddy 未在 %.0fs 内确认解锁，"
+                            "本轮任务可能仍被前置条件拦下",
+                            acc.name, _GATE_UNLOCK_WAIT)
 
                 wanted = task_codes or [
                     t.get("task_code") for t in tasks
@@ -325,18 +481,18 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
 
                     if info.get("accept_status") == "claimed":
                         item.update({"ok": True, "skipped": "已领取"})
-                        acc_log["tasks"].append(item)
+                        _push_task(acc_log, item, acc.name)
                         continue
                     if not plan.actionable:
                         # 需人工完成的任务直接跳过，绝不发请求：
                         # 之前这里也会走完整流程（含拉列表复查），是纯浪费
                         item.update({"ok": True, "skipped": plan.reason or "需人工完成"})
-                        acc_log["tasks"].append(item)
+                        _push_task(acc_log, item, acc.name)
                         continue
                     if time.monotonic() >= acc_deadline:
                         # 单账号预算用完：如实标记，不静默跳过
                         item.update({"ok": False, "skipped": "本账号超时，剩余任务留待下次"})
-                        acc_log["tasks"].append(item)
+                        _push_task(acc_log, item, acc.name)
                         acc_log["budget_exceeded"] = True
                         continue
 
@@ -347,7 +503,27 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                     state = _TaskState(s)
                     if info.get("accept_status") == "not_accepted":
                         try:
-                            s.growth_accept([code])
+                            ar = s.growth_accept([code])
+                            # ⚠️ accept 的失败**不会抛异常**：上游在信封里回
+                            # `{"<code>": "error"}` 外加一句 message（HTTP 仍是 200）。
+                            # 原来只看异常，于是把「参与失败」当成成功，
+                            # 后面照样发事件、照样报 ok=True —— 用户看到满屏成功，
+                            # 实际一个任务都没计入（这次实测 15 个里 13 个是这种）。
+                            st = (ar or {}).get(code)
+                            if st and st not in ("accepted", "already_accepted"):
+                                item["accept_failed"] = st
+                                # 把上游原话带出来，这是最有价值的信息
+                                # （实测就是它指出「需先完成 first_buddy」）
+                                msg = s.last_accept_message(code)
+                                if msg:
+                                    item["accept_message"] = msg
+                                # 参与都没成功，进度不可能计入 —— 直接跳过触发，
+                                # 省掉一次必然无效的上游请求
+                                item.update({"ok": False,
+                                             "skipped": msg or "参与任务失败"})
+                                _push_task(acc_log, item, acc.name)
+                                acc_log.setdefault("accept_blocked", []).append(code)
+                                continue
 
                             def _accepted(c=code):
                                 t = state.get(c)
@@ -377,13 +553,13 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                                 item["last_error"] = (
                                     "账号未能绑定 Ardot（connector 授权失败），"
                                     "该任务需要先完成 Ardot 授权")
-                                acc_log["tasks"].append(item)
+                                _push_task(acc_log, item, acc.name)
                                 continue
                         except Exception as e:
                             item["last_error"] = f"Ardot 绑定检查失败：{e}"
 
                     fired = 0
-                    for _ in range(times):
+                    for i in range(times):
                         # 两种触发方式：
                         #   firer 非空 -> 调用 AccountSession 上的对应方法
                         #                （上报真实业务事件，如 fire_library_read）
@@ -398,7 +574,10 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                             fired += 1
                         else:
                             item["last_error"] = r.get("msg")
-                        time.sleep(_EVENT_GAP)
+                        # 最后一次之后不用等 —— 原来每次白等 _EVENT_GAP，
+                        # 5 次任务就白花 6s，多个任务累加很可观。
+                        if i < times - 1:
+                            time.sleep(_EVENT_GAP)
 
                     # 复查：轮询到进度变化为止，避免「已完成但没领」的假象
                     def _advanced(c=code, cur=current):
@@ -422,41 +601,92 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                         item["status"] = cur_task.get("accept_status")
                     except Exception:
                         pass
-                    item.update({"ok": fired > 0, "fired": fired, "times": times})
+
+                    # ⚠️ `ok` 的判据必须是「上游真的记上了」，而不是「我们发过请求」。
+                    # 原来写的是 `fired > 0` —— 只要 HTTP 200 就算成功，
+                    # 于是实测 15 个任务全报 ok=True，实际 13 个连参与都没成功
+                    # （进度仍是 not_accepted）。这种假成功比直接报错更有害：
+                    # 用户以为做完了，实际没做。
+                    progressed = item.get("status") in ("completed", "claimed")
+                    item.update({"ok": progressed, "fired": fired, "times": times})
+                    if not progressed:
+                        item["ok"] = False
+                        if not item.get("skipped"):
+                            item["skipped"] = (item.get("accept_message")
+                                               or item.get("last_error")
+                                               or "上游未记录进度（参与未通过或事件无效）")
                     if plan.model:
                         item["model"] = plan.model
-                    acc_log["tasks"].append(item)
+                    _push_task(acc_log, item, acc.name)
 
                 # 本账号跑完顺手领取，避免用户还要再点一次「领奖」。
-                # 复用最后那次复查拿到的快照，不再额外拉一次列表。
+                #
+                # ⚠️ 这里必须**重新拉一次最新快照**（而不是复用任务循环里
+                # 那次复查的结果）：上游把任务标成 completed 有延迟，
+                # 循环里那次复查可能还看到 in_progress。之前就是复用了旧快照，
+                # 于是「任务做完了但没自动领」——用户得自己再点一次领奖，
+                # 正是反馈里的「为啥我要手动再点击领取」。
+                #
+                # 做法：轮询等到「有可领取的任务」或超时，再统一领取。
                 try:
-                    if snapshot is not None:
-                        done_codes = [t.get("task_code") for t in snapshot
-                                      if t.get("accept_status") == "completed"]
-                    else:
-                        done_codes = [t.get("task_code") for t in s.growth_tasks()
-                                      if t.get("accept_status") == "completed"]
+                    claimable: list[str] = []
+
+                    def _has_claimable() -> bool:
+                        nonlocal claimable
+                        snap = state.refresh()
+                        claimable = [t.get("task_code") for t in snap
+                                     if t.get("accept_status") == "completed"
+                                     and t.get("task_code")]
+                        return bool(claimable)
+
+                    # 最多等 _CLAIM_WAIT，但一旦看到可领取就立刻领（不等满）
+                    jobrunner.wait_for(_has_claimable, _CLAIM_WAIT, _POLL_INTERVAL)
+
                     claimed = []
-                    for code in done_codes:
+                    for code in claimable:
                         try:
                             r = s.growth_claim(code)
                             d = r.get("data") or {}
-                            claimed.append({"task_code": code, "ok": bool(r.get("ok")),
+                            claimed.append({"task_code": code,
+                                            "ok": bool(r.get("ok")),
                                             "credit": d.get("credit") or 0,
                                             "energy": d.get("energy") or 0})
-                        except Exception:
-                            pass
-                        # 只在真要领多个时才留间隔
-                        if len(done_codes) > 1:
+                        except Exception as e:
+                            claimed.append({"task_code": code, "ok": False,
+                                            "msg": str(e)[:120]})
+                        if len(claimable) > 1:
                             time.sleep(_EVENT_GAP)
                     if claimed:
                         acc_log["claimed"] = claimed
                         acc_log["credit"] = sum(c.get("credit") or 0 for c in claimed)
                         acc_log["energy"] = sum(c.get("energy") or 0 for c in claimed)
-                except Exception:
-                    pass
+                        ok_n = sum(1 for c in claimed if c.get("ok"))
+                        if ok_n < len(claimed):
+                            # 有领取失败的，如实记下来（否则界面显示领取成功、
+                            # 实际没到账，比报错更难排查）
+                            acc_log["claim_failed"] = [
+                                c for c in claimed if not c.get("ok")]
+                except Exception as e:
+                    acc_log["claim_error"] = str(e)[:160]
 
                 acc.auth_json = _updated(s, acc)
+
+                # 做完 + 领完之后**顺手刷一次真实余额**并落库。
+                #
+                # 为什么必须在这里刷：做完任务/领了奖，积分确实到账了，
+                # 但库里 `balance_remain` 还是旧值 —— 前端列表拿到旧数字，
+                # 用户会看到「任务完成了但积分没变」，以为白做了。
+                # 复用同一个 AccountSession，省掉重新建连的开销。
+                try:
+                    bal = s.fetch_balance()
+                    acc.balance_total = int(bal.get("total", 0) or 0)
+                    acc.balance_remain = int(bal.get("remain", 0) or 0)
+                    acc.last_sync_at = datetime.utcnow()
+                    acc_log["balance_total"] = acc.balance_total
+                    acc_log["balance_remain"] = acc.balance_remain
+                except Exception as e:
+                    # 刷新失败不影响任务结果，但要说清楚，便于排查
+                    acc_log["balance_error"] = str(e)[:120]
         except Exception as e:
             acc_log.update({"ok": False, "msg": str(e)})
         out.append(acc_log)
@@ -464,8 +694,13 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
         # 正常路径从不回调，前端因此一直停在 0/N，直到全部跑完才跳到 N/N。
         if on_done:
             on_done(acc_log)
-        time.sleep(_ACCOUNT_GAP)
+        # 单账号场景不必等（用户就等这一个结果，白等 1 秒纯属浪费）
+        if len(account_ids) > 1:
+            time.sleep(_ACCOUNT_GAP)
 
+    # 做完任务后必须清掉这些账号的任务缓存，否则前端紧接着的「刷新」
+    # 会拿到旧状态，看起来像「做完但界面没变」。
+    _invalidate_acct_tasks(account_ids)
     db.commit()
     return {"results": out, "model": model}
 
@@ -474,6 +709,8 @@ def claim_accounts(account_ids: list[int], task_codes: list[str] | None,
                    db: Session) -> dict:
     """对一批账号领取奖励。供接口与定时任务共用。"""
     out = []
+    # 与做任务同序（新 → 老），保证界面上的顺序稳定、可预期
+    account_ids = _ordered_ids(list(account_ids), db)
     for aid in account_ids:
         acc = db.query(Account).get(aid)
         if not acc:
@@ -491,7 +728,7 @@ def claim_accounts(account_ids: list[int], task_codes: list[str] | None,
                     codes = [t.get("task_code") for t in tasks
                              if t.get("accept_status") == "completed"]
 
-                for code in codes:
+                for i, code in enumerate(codes):
                     try:
                         r = s.growth_claim(code)
                         d = r.get("data") or {}
@@ -510,13 +747,34 @@ def claim_accounts(account_ids: list[int], task_codes: list[str] | None,
                     except Exception as e:
                         acc_log["claimed"].append(
                             {"task_code": code, "ok": False, "msg": str(e)})
-                    time.sleep(_EVENT_GAP)
+                    # 只在**还有下一个**时才等：原来每次（含最后一次）都 sleep，
+                    # 领 10 个任务就白等 12 秒 —— 这是「领奖卡卡的」主因之一。
+                    if i + 1 < len(codes):
+                        time.sleep(_EVENT_GAP)
                 acc.auth_json = _updated(s, acc)
+
+                # 领完**顺手刷一次真实余额**并落库。
+                # 不刷的话前端拿到的还是旧余额，用户会以为「领了但没到账」
+                # （实际到账了，只是库里没更新）。
+                # 放在同一个 AccountSession 里，省掉重新建连的开销。
+                try:
+                    bal = s.fetch_balance()
+                    acc.balance_total = int(bal.get("total", 0) or 0)
+                    acc.balance_remain = int(bal.get("remain", 0) or 0)
+                    acc_log["balance_total"] = acc.balance_total
+                    acc_log["balance_remain"] = acc.balance_remain
+                    acc.last_sync_at = datetime.utcnow()
+                except Exception as e:
+                    acc_log["balance_error"] = str(e)[:120]
         except Exception as e:
             acc_log.update({"ok": False, "msg": str(e)})
         out.append(acc_log)
-        time.sleep(_ACCOUNT_GAP)
+        # 账号之间保留间隔（并发打上游不礼貌），但单账号场景不该等：
+        # 只有确实还有下一个账号时才睡。
+        if len(account_ids) > 1:
+            time.sleep(_ACCOUNT_GAP)
 
+    _invalidate_acct_tasks(account_ids)
     db.commit()
     return {"results": out}
 
@@ -526,23 +784,64 @@ def growth_run(payload: RunIn, db: Session = Depends(get_db)):
     """执行任务：自动参与 + 触发完成事件。
 
     只处理策略表里标记为可自动的任务；其它任务跳过并在返回里说明原因。
+
+    ⚠️ 这是**同步**接口：账号多/任务多时会跑很久，容易撞 nginx 的 60s 超时。
+    所以：
+      * 单账号硬上限仍是 `_ACCOUNT_BUDGET`；
+      * 这里额外传 `soft_budget=_SYNC_SOFT_BUDGET`，到点就**停止接新任务**
+        （不打断当前任务），保证请求本身能及时返回；
+      * 要一次跑完多个账号请用 `/run-async`（后台线程，不受此限）。
+
+    `account_ids` 为空 = 全部可用账号（与 `/run-async` 同口径）。
+    之前这里直接把空列表透传给 `run_accounts`，于是「不传账号」= 什么都不做，
+    而 `/run-async` 的同一个参数却是「全部账号」—— 同一个字段两种语义，
+    前端稍不注意就会「点了没反应」。
     """
-    return run_accounts(payload.account_ids, payload.task_codes, db)
+    ids = _resolve_ids(payload.account_ids or None)
+    return run_accounts(ids, payload.task_codes, db,
+                        soft_budget=_SYNC_SOFT_BUDGET)
 
 
 #: 后台任务 key：同 key 同时只允许一个在跑
 JOB_KEY = "growth_run"
 
 
+def _ordered_ids(ids: list[int], db: Session) -> list[int]:
+    """把账号 id 按**创建时间倒序**（新 → 老）排好。
+
+    为什么按创建时间而不是 id 大小：批量做任务时用户希望**先看到新号**的结果
+    —— 新录入的号最可能需要处理，老号大多已经做完了。原先按 `id.asc()`
+    排，结果是「新号排在最后，前面一堆老号在快速通道里空转」，
+    用户盯着进度条等半天看不到自己刚加的号。
+
+    用 id 作为次级键：id 是自增的，与创建顺序一致，
+    且能保证同秒创建的账号也有稳定顺序（不会每次跑顺序都变）。
+    """
+    if not ids:
+        return []
+    rows = (db.query(Account.id, Account.created_at)
+            .filter(Account.id.in_(ids)).all())
+    created = {r.id: r.created_at for r in rows}
+    # created_at 为空的排最后（理论上不该有，兜底不让它插队）
+    return sorted(ids,
+                  key=lambda i: (created.get(i) is None,
+                                 -(created.get(i).timestamp() if created.get(i)
+                                   else 0),
+                                 -i))
+
+
 def _resolve_ids(payload_ids: list[int] | None) -> list[int]:
-    """把请求里的 ids 解析成实际要处理的账号 id 列表（空 = 全部 active）。"""
+    """把请求里的 ids 解析成实际要处理的账号 id 列表（空 = 全部 active）。
+
+    返回顺序统一为**创建时间倒序（新 → 老）**，见 `_ordered_ids`。
+    """
     db = SessionLocal()
     try:
         if payload_ids:
-            return list(payload_ids)
+            return _ordered_ids(list(payload_ids), db)
         rows = (db.query(Account)
                 .filter(Account.status == "active")
-                .order_by(Account.id.asc()).all())
+                .order_by(Account.created_at.desc(), Account.id.desc()).all())
         return [a.id for a in rows]
     finally:
         db.close()
@@ -561,7 +860,8 @@ def growth_run_async(payload: RunIn):
     if running and running.status == "running":
         return {"reused": True, **running.snapshot()}
 
-    ids = payload.account_ids or _resolve_ids(None)
+    # 统一按创建时间倒序（新 → 老），与 /run 的 id 解析口径一致
+    ids = _resolve_ids(payload.account_ids or None)
     tasks = payload.task_codes
 
     def worker(job: jobrunner.Job) -> dict:
@@ -569,7 +869,8 @@ def growth_run_async(payload: RunIn):
         try:
             job.set_phase("执行中")
             res = run_accounts(ids, tasks, db, on_done=job.add_item,
-                               on_beat=job.beat)
+                               on_beat=job.beat,
+                               on_task=job.task_beat)
         finally:
             db.close()
         results = res.get("results") or []
@@ -604,8 +905,22 @@ def growth_claim(payload: ClaimIn, db: Session = Depends(get_db)):
 
 
 @router.get("/accounts/{account_id}/tasks")
-def account_tasks(account_id: int, db: Session = Depends(get_db)):
-    """单个账号的任务完成情况（面板弹窗用）。"""
+def account_tasks(account_id: int, refresh: bool = False,
+                  db: Session = Depends(get_db)):
+    """单个账号的任务完成情况（面板弹窗用）。
+
+    短缓存：上游拉一次任务列表实测要 **1~3.3 秒**，而前端在「执行完 → 刷新」
+    「领奖完 → 刷新」时会立刻再拉一次，用户体感就是「卡卡的」。
+    这里缓存一个很短的窗口（默认 3 秒），既能让连续刷新秒回，
+    又不至于让状态显示过时（执行完刷新时传 refresh=True 可强制绕过）。
+    """
+    if not refresh:
+        hit = _acct_tasks_cache.get(account_id)
+        if hit and (time.time() - hit[0]) < _ACCT_TASKS_TTL:
+            data = dict(hit[1])
+            data["cached"] = True
+            return data
+
     acc = db.query(Account).get(account_id)
     if not acc:
         raise HTTPException(404, "账号不存在")
@@ -614,13 +929,19 @@ def account_tasks(account_id: int, db: Session = Depends(get_db)):
             tasks = s.growth_tasks()
             profile = s.growth_profile()
     except Exception as e:
+        # 拉取失败时退回旧缓存（哪怕过期），别让弹窗直接白屏
+        hit = _acct_tasks_cache.get(account_id)
+        if hit:
+            data = dict(hit[1])
+            data.update({"cached": True, "stale": True, "error": str(e)[:160]})
+            return data
         raise HTTPException(502, f"查询失败: {e}")
 
     items = _classify_all(tasks)
     done = sum(1 for t in items if t.get("accept_status") in ("completed", "claimed"))
     #: 可领取奖励（completed 但未 claim）
     claimable = [t for t in items if t.get("accept_status") == "completed"]
-    return {
+    out = {
         "account_id": account_id,
         "name": acc.name,
         "tasks": items,
@@ -634,6 +955,12 @@ def account_tasks(account_id: int, db: Session = Depends(get_db)):
                               and t.get("accept_status") != "claimed"),
         },
     }
+    _acct_tasks_cache[account_id] = (time.time(), out)
+    # 简单防膨胀：条目远多于账号数时清掉最旧的
+    if len(_acct_tasks_cache) > 500:
+        for k in sorted(_acct_tasks_cache, key=lambda k: _acct_tasks_cache[k][0])[:200]:
+            _acct_tasks_cache.pop(k, None)
+    return out
 
 
 @router.get("/plans")

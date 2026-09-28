@@ -47,6 +47,12 @@ class Job:
         self.items: list[dict] = []      # 每个账号的实时结果
         self.current: str = ""           # 正在处理的账号名（心跳）
         self.beat_at: datetime | None = None
+        #: 细粒度进度：当前账号已完成的任务（用于「正在做 xxx 3/15」）。
+        #: 只有账号级进度时，一个账号要跑几分钟，界面会长时间不动 ——
+        #: 用户以为卡死了。这里让前端能显示到任务级。
+        self.task_total: int = 0
+        self.task_done: int = 0
+        self.task_current: str = ""
         self._lock = threading.Lock()
 
     def add_item(self, item: dict) -> None:
@@ -55,6 +61,10 @@ class Job:
             self.items.append(item)
             self.done = len(self.items)
             self.current = ""
+            # 换账号了：任务级计数归零，重新数
+            self.task_done = 0
+            self.task_current = ""
+            self.task_total = 0
 
     def beat(self, account: str = "") -> None:
         """心跳：表示「还活着，正在处理某个账号」。
@@ -65,6 +75,24 @@ class Job:
         with self._lock:
             self.current = account
             self.beat_at = datetime.utcnow()
+            self.task_done = 0
+            self.task_current = ""
+            self.task_total = 0
+
+    def task_beat(self, account: str = "", item: dict | None = None) -> None:
+        """细粒度心跳：一个任务处理完了。
+
+        没这个的话，前端在一个账号上最多要等好几分钟都看不到任何变化。
+        """
+        with self._lock:
+            self.task_done += 1
+            self.beat_at = datetime.utcnow()
+            if account:
+                self.current = account
+            if item:
+                self.task_current = str(item.get("title") or item.get("task_code") or "")
+            # 预估总数：账号级总数 × 每个账号约 15 个任务，仅用于显示「已做 N 个」
+            self.task_total = max(self.task_total, self.task_done)
 
     def set_phase(self, phase: str) -> None:
         self.phase = phase
@@ -84,6 +112,8 @@ class Job:
             "elapsed_s": round(elapsed, 1),
             "percent": int(self.done / self.total * 100) if self.total else 0,
             "current": self.current,
+            "task_done": self.task_done,
+            "task_current": self.task_current,
             "items": list(self.items),
             "result": self.result,
             "error": self.error,

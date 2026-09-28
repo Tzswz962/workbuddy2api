@@ -85,15 +85,23 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
         ok = fail = 0
         failed_names: list[str] = []
         for a in db.query(Account).filter(Account.status == "active").all():
-            if acc_router._refresh_balance(a):
+            # with_expiry=True：顺带统计「快过期积分」。
+            # 这个字段是选号策略（oldest / weighted）的依据 —— 之前一直是 0，
+            # 导致「先用快过期的额度」这条规则实际上从未生效。
+            if acc_router._refresh_balance(a, with_expiry=True):
                 ok += 1
             else:
                 fail += 1
                 failed_names.append(_account_label(a))
             db.commit()
+        expiring = sum(int(a.credits_expiring or 0)
+                       for a in db.query(Account).filter(
+                           Account.status == "active").all())
         return {"task": task, "ok": True, "refreshed": ok, "failed": fail,
+                "credits_expiring": expiring,
                 "failed_accounts": failed_names[:10],
                 "summary": (f"刷新成功 {ok} 个账号"
+                            + (f"，快过期积分 {expiring}" if expiring else "")
                             + (f"，{fail} 个失败：{'、'.join(failed_names[:3])}"
                                if fail else ""))}
     if task == "sync_models":
@@ -256,7 +264,13 @@ def run_growth_tasks() -> dict:
             return {"task": "run_growth_tasks", "ok": True, "accounts": 0,
                     "msg": "没有可用账号"}
 
-        run_res = growth_router.run_accounts(ids, None, db)
+        run_res = growth_router.run_accounts(
+            ids, None, db,
+            # 整批预算：定时任务在**调度线程**里同步跑，跑多久占多久。
+            # 没有这个上限时，23 个账号最坏能占住调度线程一个多小时，
+            # 期间整点刷新余额 / 签到 / token 保活全部停摆
+            # （表现为「定时任务卡住了」）。超出预算的账号如实记录、留待下次。
+            soft_budget=growth_router._SCHEDULE_SOFT_BUDGET)
     except Exception as e:
         return {"task": "run_growth_tasks", "ok": False, "error": str(e)}
     finally:

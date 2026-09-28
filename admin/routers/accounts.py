@@ -3,7 +3,7 @@ import glob
 import json
 import os
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 from typing import Optional
 
@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from admin import backend, jobrunner
+from admin import backend, jobrunner, wb_login
 from admin.config import settings
 from admin.db import SessionLocal, get_db
 from admin.models import Account
@@ -27,6 +27,9 @@ class AccountIn(BaseModel):
 
 class AccountBatchIn(BaseModel):
     items: list[AccountIn]
+    #: 是否对每条做**真实上游验证**（默认开）。关掉只做结构校验，
+    #: 速度快但无法识别伪造签名的凭证 —— 只建议在导入自己刚导出的数据时用。
+    verify: bool = True
 
 
 class InjectIn(BaseModel):
@@ -49,6 +52,65 @@ def _uid_of(auth_json: str) -> str:
         return (backend.parse_auth_meta(auth_json) or {}).get("uid") or ""
     except Exception:
         return ""
+
+
+def _reject_non_credential(auth_json: str) -> dict:
+    """上传入口的**唯一**把关：不是客户端授权凭证就拒收。
+
+    这里刻意复用 `wb_login.validate_credential` —— 与手机号登录入库那条路
+    共用同一个校验器。两条路对「什么算合法凭证」必须完全一致，
+    否则严格的那条就成了摆设（攻击者走宽松的那条即可）。
+
+    为什么必须拦（而不是像原来那样只 `json.loads` 一下）：
+    `json.loads` 只证明「是合法 JSON」，`{}`、`{"foo":1}`、
+    `/v1/auth/accounts` 的账号列表、裸 accessToken 全都算「合法 JSON」，
+    但它们都不是凭证 —— 收进来只会得到一条刷新余额必然失败的死记录，
+    还会污染号池统计（看起来有 N 个号，实际可用的是少数）。
+
+    抛 400 并把原因回给调用方，避免用户面对一句「格式错误」无从下手。
+    返回校验得到的 meta（uid 等），供调用方复用。
+    """
+    check = wb_login.validate_credential(auth_json)
+    if not check.ok:
+        raise HTTPException(status_code=400, detail={
+            "message": f"不是有效的客户端凭证：{check.reason}",
+            "step": "validate",
+        })
+    return check.meta
+
+
+def _verify_credential_live_or_400(auth_json: str):
+    """**真实上游**验证：确认凭证可用、非伪造，并取回真实账号信息 + 余额。
+
+    与 `_reject_non_credential`（纯结构）是两道独立关卡：
+    结构校验挡不住「JWT 字段齐全但签名是编的」——那种凭证的
+    accessToken/refreshToken/uid/expiresAt 全都能随手编。
+
+    返回 `(profile, balance)`；`balance` 是验证阶段顺带拿到的真实余额，
+    调用方可以直接写库，**不必再补一次完全一样的请求**。
+    """
+    probe = wb_login.probe_credential_live(auth_json)
+    if not probe.ok:
+        raise HTTPException(status_code=400, detail={
+            "message": f"凭证未通过上游验证：{probe.message}",
+            "step": "live_probe",
+            "reason": probe.reason,
+        })
+    return (probe.profile or {}), (probe.balance or {})
+
+
+def _post_login_automation(account_id: int, name: str) -> None:
+    """登录/上传成功后，后台自动做成长任务 + 猫猫旅行 + 签到。
+
+    直接复用登录路由里那套实现：**同一个行为不该有两份代码**，
+    否则「手机号注册进来的号会自动做任务、上传进来的号不会」这种
+    不一致会非常难发现。
+    """
+    try:
+        from admin.routers.login import _schedule_post_login_automation
+        _schedule_post_login_automation(account_id, name)
+    except Exception:
+        _logger.exception("提交登录后自动任务失败（不影响入库）")
 
 
 def _existing_uid_index(db: Session) -> dict[str, Account]:
@@ -136,29 +198,93 @@ def _client_auth_dir() -> str:
     return os.path.expandvars(d)
 
 
-def _apply_meta(acc: Account, auth_json: str):
+def _apply_meta(acc: Account, auth_json: str, profile: dict | None = None,
+                balance: dict | None = None):
+    """把凭证里的元信息落到账号记录上。
+
+    `profile` 是**上游验证时返回的真实账号信息**。它优先于凭证里声明的值：
+    凭证的 `account.*` 是提交者自己写的（可以由着性子改），而上游返回的
+    是腾讯侧的事实 —— 用事实覆盖声明，避免「真令牌 + 假昵称/假 uid」入库。
+
+    `balance` 是验证阶段顺带拿到的真实余额，直接写库，
+    不用再补一次 `fetch_balance()`（同一个请求打两遍纯属浪费）。
+    """
     meta = backend.parse_auth_meta(auth_json)
+    prof = profile or {}
     acc.auth_json = auth_json
-    if meta.get("uid"):
-        acc.uid = meta["uid"]
-    if meta.get("enterprise_id"):
-        acc.enterprise_id = meta["enterprise_id"]
+    uid = str(prof.get("uid") or meta.get("uid") or "")
+    if uid:
+        acc.uid = uid
+    eid = str(prof.get("enterpriseId") or meta.get("enterprise_id") or "")
+    if eid:
+        acc.enterprise_id = eid
     if meta.get("domain"):
         acc.domain = meta["domain"]
-    # 号池名称：真实昵称 → uid → 兜底（昵称为 null/空串/"null" 视为缺失）
-    nick = meta.get("nickname")
-    if isinstance(nick, str):
-        nick = nick.strip()
+    # 余额：拿不到就不动（绝不写 0 覆盖掉已知的真实值）
+    if balance:
+        acc.balance_total = int(balance.get("total") or 0)
+        acc.balance_remain = int(balance.get("remain") or 0)
+        acc.last_sync_at = datetime.utcnow()
+    # 号池名称：上游真实昵称 → 上游手机号 → 凭证昵称 → uid
+    # （昵称为 null/空串/"null" 一律视为缺失）
+    def _clean(v) -> str:
+        s = (v if isinstance(v, str) else "").strip()
+        return "" if s.lower() in ("null", "none") else s
+
     if not acc.name:
-        acc.name = (nick if nick and nick.lower() != "null" else None) or meta.get("uid") or "未命名"
+        acc.name = (_clean(prof.get("nickname")) or _clean(prof.get("phoneNumber"))
+                    or _clean(meta.get("nickname")) or uid or "未命名")
 
 
-def _refresh_balance(acc: Account) -> bool:
+#: 「快过期积分」的判定窗口（天）。
+#: 官方赠送/任务获得的积分按批过期（实测多为 30 天），不用就作废，
+#: 所以把这个窗口内的剩余额度单独统计出来，作为选号权重与展示依据。
+EXPIRING_SOON_DAYS = 30
+
+
+def _compute_expiring(packages: list[dict]) -> int:
+    """从积分明细里算出「即将过期」的剩余额度合计。
+
+    判定：`deduction_end_ts > 0`（有过期时间）且距今不超过
+    EXPIRING_SOON_DAYS 天，把这些包的 `remain` 加起来。
+    永久有效的包（`deduction_end_ts == 0`）不计入。
+    """
+    now_ms = datetime.now(timezone.utc).timestamp() * 1000
+    horizon_ms = EXPIRING_SOON_DAYS * 86400 * 1000
+    total = 0
+    for p in packages or []:
+        try:
+            ts = int(p.get("deduction_end_ts") or 0)
+        except Exception:
+            continue
+        if ts <= 0:
+            continue
+        left = ts - now_ms
+        if 0 <= left <= horizon_ms:
+            total += int(p.get("remain") or 0)
+    return total
+
+
+def _refresh_balance(acc: Account, with_expiry: bool = False) -> bool:
+    """刷新账号余额。
+
+    Args:
+        with_expiry: 是否同时统计「快过期积分」。
+            需要多打一次 `fetch_credit_details`（约 0.4s），
+            所以只在整点定时任务里开 —— 高频路径（登录后收尾）不开，
+            但**至少会保留上一次的值**，不会因为不刷新就被清零。
+    """
     try:
         with backend.AccountSession(acc.auth_json) as sess:
             bal = sess.fetch_balance()
             acc.balance_total = int(bal.get("total", 0) or 0)
             acc.balance_remain = int(bal.get("remain", 0) or 0)
+            if with_expiry:
+                try:
+                    acc.credits_expiring = _compute_expiring(
+                        sess.fetch_credit_details())
+                except Exception:
+                    pass  # 拿不到就保留旧值（不写 0 覆盖）
             acc.auth_json = sess.updated_json()  # 回写可能刷新的 token
         acc.last_sync_at = datetime.utcnow()
         return True
@@ -197,29 +323,45 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
 
 @router.post("")
 def add_account(body: AccountIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    try:
-        json.loads(body.auth_json)
-    except Exception:
-        raise HTTPException(status_code=400, detail="auth_json 不是合法 JSON")
+    # 第一道：只收「auth 之后的授权 JSON」，非凭证一律 400
+    _reject_non_credential(body.auth_json)
+    # 第二道：**真调上游**确认凭证可用、非伪造，并取回真实账号信息 + 余额
+    profile, balance = _verify_credential_live_or_400(body.auth_json)
+
     # 按 uid 去重：同一个人重复添加只会产生垃圾记录，
     # 而且会让批量任务对同一个号跑多次（白等、看起来像卡住）
     dup = _find_dup(db, body.auth_json)
     if dup:
+        # 重复上传 = 用新凭证覆盖 + 刷新余额（原来直接 return，
+        # 于是重传一份新凭证后列表还显示旧余额，看起来「没生效」）
+        dup.auth_json = body.auth_json
+        _apply_meta(dup, body.auth_json, profile=profile, balance=balance)
+        db.commit()
+        _post_login_automation(dup.id, dup.name or dup.uid)
         return {"id": dup.id, "name": dup.name, "ok": True,
                 "duplicated": True,
-                "message": f"该账号已存在（id={dup.id}），未重复添加"}
+                "message": f"该账号已存在（id={dup.id}），已用新凭证覆盖更新"}
     acc = Account(name=body.name) if body.name else Account()
-    _apply_meta(acc, body.auth_json)
+    _apply_meta(acc, body.auth_json, profile=profile, balance=balance)
     db.add(acc)
     db.commit()
     db.refresh(acc)
     _refresh_balance(acc)
     db.commit()
-    return {"id": acc.id, "name": acc.name, "ok": True, "duplicated": False}
+    _post_login_automation(acc.id, acc.name or acc.uid)
+    return {"id": acc.id, "name": acc.name, "ok": True, "duplicated": False,
+            "verified": True, "balance_remain": acc.balance_remain}
 
 
 @router.post("/batch")
 def batch_add(body: AccountBatchIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """批量上传：逐条做**结构校验 + 真实上游验证**，不合格的记进 errors 并跳过。
+
+    `verify` 默认为 True。批量上传时如果每条都真调上游会慢（每条 1-2 次请求），
+    但对「拒绝伪造凭证」这个要求来说这是必须的 —— 结构校验挡不住伪造签名。
+    调用方若明确只想快速导入（例如刚从本机导出、已知有效），可显式传
+    `verify=False` 跳过上游验证，但**结构校验永远执行**。
+    """
     added = 0
     skipped = 0
     errors = []
@@ -229,26 +371,47 @@ def batch_add(body: AccountBatchIn, _: bool = Depends(require_admin), db: Sessio
     for it in body.items:
         if not it.auth_json or not it.auth_json.strip():
             continue
-        try:
-            json.loads(it.auth_json)
-        except Exception:
-            errors.append("跳过一条：auth_json 非法 JSON")
+        # 第一道：非凭证拒收（与单条上传、与手机号登录共用同一校验器）
+        chk = wb_login.validate_credential(it.auth_json)
+        if not chk.ok:
+            errors.append(f"跳过一条：不是有效的客户端凭证（{chk.reason}）")
             continue
-        uid = _uid_of(it.auth_json)
+
+        # 第二道：真调上游确认可用、非伪造（可显式关闭）
+        profile: dict = {}
+        balance: dict = {}
+        if body.verify:
+            probe = wb_login.probe_credential_live(it.auth_json)
+            if not probe.ok:
+                errors.append(f"跳过一条：未通过上游验证（{probe.message}）")
+                continue
+            profile = probe.profile or {}
+            balance = probe.balance or {}
+
+        # uid 以上游返回的真实值为准（挡「真令牌 + 假 uid」）
+        uid = str(profile.get("uid") or _uid_of(it.auth_json) or "")
         if uid and uid in seen:
+            # 已存在 -> 覆盖新凭证并刷新余额（与单条上传同口径）
+            old = seen[uid]
+            old.auth_json = it.auth_json
+            _apply_meta(old, it.auth_json, profile=profile, balance=balance)
+            db.commit()
             skipped += 1
             continue
         acc = Account(name=it.name) if it.name else Account()
-        _apply_meta(acc, it.auth_json)
+        _apply_meta(acc, it.auth_json, profile=profile, balance=balance)
         db.add(acc)
         db.commit()
         db.refresh(acc)
         if uid:
             seen[uid] = acc
+        _post_login_automation(acc.id, acc.name or acc.uid)
         if _refresh_balance(acc):
             added += 1
         else:
-            errors.append(f"账号 {acc.id} 余额刷新失败（凭据可能失效）")
+            # 走到这里说明上游验证已过（或未开启），余额刷新失败通常是
+            # 瞬时网络问题 —— 记为警告而不是拒绝，凭证本身是可信的。
+            errors.append(f"账号 {acc.id} 余额刷新失败（凭据可能失效，请稍后刷新）")
         db.commit()
     return {"added": added, "skipped": skipped, "errors": errors}
 
@@ -384,9 +547,14 @@ def import_local(body: ImportLocalIn, _: bool = Depends(require_admin), db: Sess
             continue
         try:
             auth = open(path, encoding="utf-8").read()
-            json.loads(auth)
         except Exception:
-            errors.append(f"{name}: 读取/解析失败")
+            errors.append(f"{name}: 读取失败")
+            continue
+        # 目录里的 *.info 未必都是凭证（可能有半截文件 / 别的 JSON），
+        # 与上传入口用同一个校验器把关，避免把垃圾读进号池。
+        chk = wb_login.validate_credential(auth)
+        if not chk.ok:
+            errors.append(f"{name}: 不是有效的客户端凭证（{chk.reason}）")
             continue
         meta = backend.parse_auth_meta(auth)
         uid = meta.get("uid")
@@ -394,6 +562,9 @@ def import_local(body: ImportLocalIn, _: bool = Depends(require_admin), db: Sess
             skipped += 1
             continue  # 同 uid 多文件 / 已存在，只导入一次
         acc = Account()
+        # 这是**本机客户端自己写的**登录态，可信度天然高于网页上传，
+        # 故不做额外的上游验证；`_refresh_balance` 已经会真调一次上游，
+        # 失败时记为警告（凭证本身来自本机，不该因瞬时网络问题被丢弃）。
         _apply_meta(acc, auth)
         db.add(acc)
         db.commit()
@@ -403,7 +574,7 @@ def import_local(body: ImportLocalIn, _: bool = Depends(require_admin), db: Sess
         if _refresh_balance(acc):
             added += 1
         else:
-            errors.append(f"账号 {acc.id}({acc.name}) 余额刷新失败（凭据可能失效）")
+            errors.append(f"账号 {acc.id}({acc.name}) 余额刷新失败（稍后可手动刷新）")
         db.commit()
     return {"added": added, "skipped": skipped, "errors": errors}
 

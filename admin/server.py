@@ -12,7 +12,8 @@ from admin.config import settings
 from admin.db import SessionLocal, init_db, wait_database_ready
 from admin.models import SystemSetting
 from admin.routers import (accounts, app_source, client_profile, groups, growth,
-                           keys, logs, models, proxy, schedules, stats, sync)
+                           keys, login as login_router, logs, models, proxy,
+                           schedules, stats, sync)
 from admin.ratelimit import (clear_failures, get_client_ip, get_trusted_client_ip,
                              is_locked, record_failure)
 from admin.security import (
@@ -23,6 +24,38 @@ from admin.security import (
 )
 
 logger = logging.getLogger("admin.server")
+
+
+def _ensure_admin_logging() -> None:
+    """给 `admin.*` 日志挂上 handler，让 INFO 级诊断日志真的能落盘。
+
+    为什么需要：uvicorn 只给自己那几个 logger（uvicorn/uvicorn.error/
+    uvicorn.access）配 handler，**root logger 保持默认的 WARNING 且无 handler**。
+    于是本项目里所有 `logging.getLogger("admin.xxx")` 打出的 INFO/DEBUG
+    全部被静默丢弃 —— 包括手机号登录链路的排障日志（轮询状态、上游验证结果、
+    为什么兑换失败）。表现就是「日志里只有 access log，看不出功能到底跑没跑」，
+    排查问题时非常难受。
+
+    这里显式给 `admin` 这棵 logger 树挂一个 StreamHandler（stdout），
+    而 main.py 本来就是 subprocess.stdout -> logs/admin.log，所以能落盘。
+    只挂一次（用标记位防重复，`--reload` 或多 worker 下会重复进入本函数）。
+    """
+    root_admin = logging.getLogger("admin")
+    if getattr(root_admin, "_wb_logging_ready", False):
+        return
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"))
+    root_admin.addHandler(h)
+    root_admin.setLevel(logging.INFO)
+    # 不要把日志再往 root 传：root 没有 handler，传上去只会在
+    # 「basicConfig 被别人的库调用过」时打出重复行。
+    root_admin.propagate = False
+    root_admin._wb_logging_ready = True
+
+
+_ensure_admin_logging()
 
 # 可选内嵌独立网关 converter：把它挂到 /gw 前缀下，实现「单端口单进程」部署。
 # converter 用本机桌面登录态直连后端，并额外提供 /v1/responses、/v1/messages（Anthropic）、
@@ -78,10 +111,26 @@ app.include_router(stats.router)
 app.include_router(growth.router)
 app.include_router(client_profile.router)
 app.include_router(app_source.router)
+app.include_router(login_router.router)
+# 自助上传页（无需后台登录态）：复刻 WorkBuddy 手机号登录页，
+# 让「发给朋友」这一诉求成立 —— 对方不需要知道后台口令。
+app.include_router(login_router.public_router)
 
 
 @app.on_event("startup")
 def _startup():
+    # 启动手机号登录会话的**定时回收**线程。
+    #
+    # 为什么必须定时回收：原来的 `_gc_locked()` 只在「新建会话」时被调用，
+    # 于是流量停下后过期会话就一直留在表里，每个都攥着一个 httpx.Client
+    # （连接池 + socket）—— 这是真实的资源泄漏，表现为「内存慢慢涨」。
+    # 放在 try 里：回收线程起不来不该影响服务启动。
+    try:
+        from admin import wb_login
+        wb_login.start_gc_thread()
+    except Exception:
+        logger.exception("手机号登录会话回收线程启动失败（不影响其它功能）")
+
     # 未配置登录凭据时给出醒目告警：此时后台登录一律 503，不会退化成空口令
     if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
         logger.warning(
@@ -287,6 +336,21 @@ def index_redirect():
 @app.get("/admin/")
 def admin_index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/join")
+@app.get("/join/")
+def join_index():
+    """公开注册页（复刻 WorkBuddy 手机号登录页）。
+
+    这是要「直接发给别人」的地址：对方打开即可用手机号 + 验证码完成注册，
+    服务端自动完成整条 auth 授权 —— **无需后台口令、无需邀请码、无需客户端**，
+    手机浏览器即可完成。
+
+    页面本身不含任何敏感数据；服务端唯一的防线是发码节流
+    （见 admin/routers/login.py 的 `_check_sms_quota`）。
+    """
+    return FileResponse(STATIC_DIR / "join.html")
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

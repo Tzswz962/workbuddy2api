@@ -1,5 +1,13 @@
 # workbuddy2api
 
+> 🎧 **本项目为纯 vibe coding 产物** —— 由 **DeepSeek** 模型与 **DSH** 智能体提供技术支持。
+>
+> - 模型：[DeepSeek 开放平台](https://platform.deepseek.com)
+> - 智能体：[deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)
+>
+> 也就是说：代码、排查与文档都是在「人提需求 → 智能体落地」的循环里直接产出的。
+> 欢迎来玩这两个工具 👆
+
 把 **WorkBuddy / CodeBuddy（腾讯代码助手）** 的桌面端登录态，转成你本机 / 局域网可直接使用的 **OpenAI / Anthropic 兼容 API**，并提供一个 **多账号代理共享 + 自动化运营平台**。
 
 ## 它是什么
@@ -37,6 +45,10 @@
 <img src="./images/img_3.png">
 <img src="./images/img_4.png">
 
+**手机号验证登录（公开注册页，无需口令 / 邀请码）**
+
+<img src="./images/img_5.png">
+
 ## 目录
 
 - [一、逆向工程：解包 WorkBuddy 桌面端源码（app_source）](#一逆向工程解包-workbuddy-桌面端源码app_source)
@@ -44,6 +56,8 @@
 - [三、多账号代理共享平台（admin）](#三多账号代理共享平台admin)
   - [3.7 使用记录：默认近 1 天，可按 Key / 模型筛选](#37-使用记录默认近-1-天可按-key--模型筛选)
   - [3.8 定时任务结果：人话摘要](#38-定时任务结果人话摘要)
+  - [3.9 手机号验证登录（纯协议自动入库）](#39-手机号验证登录纯协议自动入库)
+  - [3.10 成长任务：执行速度与「如实上报」](#310-成长任务执行速度与如实上报)
 - [四、环境安装与项目运行](#四环境安装与项目运行)
 - [五、每日签到定时任务（daily_checkin）](#五每日签到定时任务daily_checkin)
 - [六、成长计划任务（growth）](#六成长计划任务growth)
@@ -55,7 +69,7 @@
 - [八、日志与排障](#八日志与排障)
 - [九、项目结构](#九项目结构)
 - [十、稳定性与流量治理（限速 / 并发 / 保活）](#十稳定性与流量治理限速--并发--保活)
-  - [10.1 选号：三因子加权 + Top-N 抽签](#101-选号三因子加权--top-n-抽签)
+  - [10.1 选号策略：默认「最老录入优先」](#101-选号策略默认最老录入优先)
   - [10.2 并发：在途租约（把并发摊平到全池）](#102-并发在途租约把并发摊平到全池)
   - [10.3 会话粘性：同一会话固定同一账号](#103-会话粘性同一会话固定同一账号)
   - [10.4 错误分类与账号处置（一张表看懂）](#104-错误分类与账号处置一张表看懂)
@@ -248,7 +262,10 @@ WORKBUDDY_VERSION              # 默认 2.0.0
 **代理共享**
 
 - **批量上传账号**：把桌面端 `.info` 登录文件原文（或数组 / 逐行）批量导入，存进 MySQL
-- **账号池自动切换**：每次请求从「启用 + 还有剩余额度」的账号里挑选（默认剩余最多优先，可切 LRU）
+- **手机号验证登录（纯协议）**：把注册页地址发给任何人，对方用自己的手机号收验证码登录，
+  服务端**自动完成 auth 授权、取出客户端凭证并入库** —— 全程不需要桌面端、不需要破解验证码。
+  同一个号重复登录按 uid **更新**而不会重复建号 —— 见 [3.9](#39-手机号验证登录纯协议自动入库)
+- **账号池自动切换**：每次请求从「启用 + 还有剩余额度」的账号里挑选（默认**最老录入优先**，可切余额优先 / LRU / 加权随机）
 - **查余额 / 刷新**：后台随时看每个账号总积分、剩余额度，并触发实时刷新
 - **API Key 管理**：后台创建 Key 给别人用，可设每个 Key 的积分上限
 - **模型分组**：把模型划进分组，Key 绑定分组后**只能调用组内模型**（越权返回 `403 model_not_in_group`）
@@ -322,7 +339,7 @@ WORKBUDDY_VERSION              # 默认 2.0.0
 
 ### 3.5 环境变量（admin）
 
-`ADMIN_DATABASE_URL` · `ADMIN_REDIS_URL` · `ADMIN_BACKEND` · `ADMIN_USERNAME` · `ADMIN_PASSWORD` · `ADMIN_JWT_SECRET`（≥32 字节）· `ADMIN_JWT_EXPIRE_HOURS` · `ADMIN_COST_PER_TOKEN` · `ADMIN_ACCOUNT_SELECT`（`remain` / `lru` / `weighted`）· `ADMIN_PORT` · `ADMIN_CLIENT_AUTH_DIR` · `CONVERTER_API_KEY`（内嵌 `/gw` 网关的 Key；**不配则不挂载 `/gw`**）· `ADMIN_ENABLE_DOCS`（默认 `0`，公网请保持关闭，见 [10.13](#1013-安全加固2026-09-24-外部审计后的修复)）
+`ADMIN_DATABASE_URL` · `ADMIN_REDIS_URL` · `ADMIN_BACKEND` · `ADMIN_USERNAME` · `ADMIN_PASSWORD` · `ADMIN_JWT_SECRET`（≥32 字节）· `ADMIN_JWT_EXPIRE_HOURS` · `ADMIN_COST_PER_TOKEN` · `ADMIN_ACCOUNT_SELECT`（`oldest` 默认 / `remain` / `lru` / `weighted`，见 [10.1](#101-选号策略默认最老录入优先)）· `ADMIN_PORT` · `ADMIN_CLIENT_AUTH_DIR` · `CONVERTER_API_KEY`（内嵌 `/gw` 网关的 Key；**不配则不挂载 `/gw`**）· `ADMIN_ENABLE_DOCS`（默认 `0`，公网请保持关闭，见 [10.13](#1013-安全加固2026-09-24-外部审计后的修复)）
 
 流量治理（详见 [第十章](#十稳定性与流量治理限速--并发--保活)，完整清单见 `.env.example`）：
 
@@ -432,6 +449,91 @@ Anthropic 端点（`/v1/messages`）相关：
 **账号标签做脱敏**：结果里用 `177****5501` 而不是完整手机号。
 既够辨认是哪个号（正是「哪个账号没领成功」需要的信息），
 又不把完整号码写进会被截图、会随日志流转的地方；没有名字才回落到 `账号#12`。
+
+---
+
+### 3.9 手机号验证登录（纯协议自动入库）
+
+**目标**：把一条地址发给任何人，对方**用自己的手机号**收验证码登录，
+系统自动拿到客户端凭证并入库 —— **不需要装桌面端、不需要破解图形验证码**。
+
+这是「批量上传账号」的补充：上传依赖别人已经有一份 `.info` 文件，
+而这条路径让完全没有客户端的人也能贡献一个可用账号。
+
+| 项 | 说明 |
+|---|---|
+| 公开地址 | `GET /join`（无口令、无邀请码，样式与资源全部本地化） |
+| 发起会话 | `POST /api/join/start` → `{sid}` |
+| 发验证码 | `POST /api/join/send` |
+| 校验并入库 | `POST /api/join/verify`（自动完成授权 + 双重校验 + 按 uid 去重） |
+| 官方页面接力 | `POST /api/join/official/start` / `.../poll`（上游要求图形验证码时走这条） |
+
+**两条路径都能走通，区别只在「谁来过验证码」**：
+
+1. **纯协议**（主路径）：服务端自己驱动 OneID 短信登录，全程不碰浏览器。
+2. **官方页面接力**（兜底）：同号码短时间重复发码会被上游要求图形验证码；
+   此时把用户引导到腾讯官方页面自行登录，服务端只轮询
+   `/v2/plugin/auth/token?state=` 把凭证换回来。
+   *关键实测结论*：该轮询**不需要任何 cookie**，只认 URL 里的 `state` ——
+   所以服务端能独立取到凭证，完全不必触碰用户会话，
+   也**绕开了官方收尾那个需要桌面端接管的 `workbuddy://` 私有协议跳转**。
+
+**入库前的双重把关**（与批量上传共用同一套校验器，不存在"注册页宽松一点"的后门）：
+
+1. **结构校验**：拒绝空、非 JSON、数组、缺 `auth`/`account`、缺或过期 JWT、
+   缺 `refreshToken`、uid 字符集异常、uid 与 JWT `sub` 不一致；
+2. **真实上游验证**：真调一次上游确认凭证可用 —— 结构校验挡不住
+   「字段齐全但签名是编的」。顺带**取回真实 uid 与余额**，
+   用上游事实覆盖凭证里的自我声明（挡「真令牌 + 假 uid」）。
+
+**体验细节**：
+
+* 全程零 `alert()`，用页面内 toast；
+* 文案是「**注册成功**」，不出现「上传」字样 —— 不让人误以为手机号被偷偷收集；
+* 余额在验证阶段顺手写入（**不额外多打一次上游**），列表不会显示 `0/0`；
+* 入库后后台自动做成长任务 / 猫猫旅行 / 签到（有并发上限，拿不到名额就跳过）。
+
+**并发与资源保护**（实测数据见下文）：
+
+* 全局并发闸门（默认 8）：注册洪峰不会拖垮无关接口
+  （实测无关接口 p95 从 **4938ms → 335ms**）；
+* 会话表上限 + **定时回收线程**（原来只在新建会话时回收，会漏 `httpx.Client`）；
+* 分级超时（连接 5s / 读 10s / 池 5s）；
+* 并发注册同一账号按 uid 串行化：实测 8 并发原来会建出 **6 条重复记录**，现为 1 条。
+
+**发码节流**（公开页唯一防线）：同手机号 60 秒间隔、同 IP 每小时 10 次上限。
+间隔刻意绑**手机号**而不是 IP —— 用户常共用出口（公司/校园 NAT、运营商 CGNAT），
+按 IP 限间隔会让第二个人被第一个人挡掉。
+
+---
+
+### 3.10 成长任务：执行速度与「如实上报」
+
+**速度**：单账号跑完全部可自动化任务，实测 **279.6s → 168.8s**。来源是三处：
+
+* 单账号预算 `45s → 300s`（45s 根本不够，必然做 2~3 个就报「本账号超时」，用户得反复点）；
+* 触发循环里最后一次之后不再白等（原每次都 `sleep`，5 次任务白花 6s）；
+* 领奖只在「还有下一个」时才等间隔（原来最后一个也等，单账号也等账号间隔）。
+
+**两个「假装成功」的坑（都已修）**：
+
+1. **上游要求先完成 `first_buddy`**，否则 accept 回
+   `{"status":"error","message":"prerequisite not met: first_buddy"}`，
+   而 **HTTP 仍是 200**。原来不检查 `status`、且 `ok` 判据写成「我们发过请求」，
+   于是 **15 个任务全报成功、实际 13 个连参与都没成功**。
+   现在 `ok` 以上游真实进度为准，并把上游原话带回界面。
+2. **解锁有竞态**：补完门槛对话后上游需要时间解锁其余任务，
+   太早进入任务循环会白跑一整轮（实测 14 个任务全被拦）。
+   现在轮询确认解锁后再继续。
+
+**批量顺序**：统一按**创建时间倒序（新 → 老）**，并且放在公共函数里，
+让同步接口 / 异步任务 / 定时任务**三者顺序完全一致**。
+
+**定时任务不会被拖死**：定时任务是在**调度线程里同步跑**的，
+23 个账号最坏能占住调度线程一个多小时，期间整点刷新 / 签到 / token 保活全部停摆。
+现在加整批预算（25 分钟），到点收尾、未处理的账号如实记录「留待下次」。
+
+> 详细记要与实测数字见同目录 `docs/workbuddy-phone-login.md`（内部资料，不随仓库分发）。
 
 ---
 
@@ -1091,15 +1193,19 @@ workbuddy2api/
 │   ├── models.py             # Account / AccountModelCooldown / ApiKey / UsageLog / Schedule ORM
 │   ├── security.py           # JWT、Key 哈希、配额拦截
 │   ├── backend.py            # 复用 converter.CredentialManager 操作单账号（含签到 / 成长任务 / Ardot 画布）
+│   ├── wb_login.py           # 手机号验证登录（纯协议）：驱动 OneID 短信登录 → 自动授权 → 取客户端凭证
 │   ├── pool.py               # 流量治理原语：在途租约 / 会话粘性 / 防撞号 / WAF IP 闸 / 三因子加权选号
 │   ├── growth_plans.py       # 成长任务分级与完成策略表（实测结论沉淀处）
 │   ├── scheduler.py          # 轻量定时任务：refresh_balances / sync_models / daily_checkin / refresh_growth_tasks / run_growth_tasks / keepalive_tokens
 │   ├── turing_token.py       # Python 侧 X-Device-Token 提供器（subprocess 调 helper）
 │   ├── client_profile.py     # 客户端参数档案：UA/版本号/风控头/指纹的探测→保存→生效→同步
 │   ├── wb_paths.py           # 客户端路径覆盖（安装目录/产物目录）落库并注入 wb_install
-│   ├── jobrunner.py          # 后台任务执行器（拆包等耗时操作异步化 + 进度轮询）
-│   ├── routers/              # accounts / app_source / client_profile / groups / growth / keys / proxy / schedules / logs / stats / sync / models
-│   └── static/index.html     # 纯 HTML + TailwindCSS + FontAwesome 管理大屏（面板状态写入 ?tab=）
+│   ├── jobrunner.py          # 后台任务执行器（批量任务异步化 + 账号级/任务级进度轮询）
+│   ├── routers/              # accounts / app_source / client_profile / groups / growth / keys / login / proxy / schedules / logs / stats / sync / models
+│   └── static/
+│       ├── index.html        # 管理大屏（面板状态写入 ?tab=）
+│       ├── join.html         # 公开的手机号注册页（无口令/邀请码；零 CDN、零 alert）
+│       └── vendor/           # 本地化的 Tailwind 产物 + FontAwesome（含字体），断网可用
 ├── tests/                    # 本地回归测试（.gitignore 忽略，不进仓库）
 │   ├── test_pool.py          # 号池治理 / 错误分类 / 200 体内错误 / 端口优先级 / 会话键 / 画布 id / SSE 聚合 / 安装发现 / 客户端参数 / 拆包 / 端口接管 / 限流码族 / 链路头族（548 项）
 │   ├── test_e2e_db.py        # 真实库端到端：迁移 / 保活任务 / 选号链路（48 项）
@@ -1117,6 +1223,9 @@ workbuddy2api/
 
 > `scripts/*.py` 与 `tests/` 都被 `.gitignore` 忽略（本地回归工具，不进仓库）。
 > 它们在本机检出里仍然可用。
+>
+> `docs/` 同样被忽略：里面是协议逆向取证与排查记录，**含未脱敏的真实手机号与
+> token 片段**，属于内部资料而非产品代码。
 
 #### 管理大屏的面板状态：地址栏 `?tab=`
 
@@ -1139,9 +1248,31 @@ workbuddy2api/
 本章是「把号池跑稳」的部分。原则是**只借该借的**：参考项目的成熟设计拿来加固既有实现，
 而不是照抄重写；每条改动都对应一个具体失效模式，并尽量落到官方源码或真机实测上。
 
-### 10.1 选号：三因子加权 + Top-N 抽签
+### 10.1 选号策略：默认「最老录入优先」
 
-`ADMIN_ACCOUNT_SELECT=weighted` 时启用（默认仍是 `remain`）：
+`ADMIN_ACCOUNT_SELECT` 决定从健康账号里挑谁，可选四种：
+
+| 值 | 含义 | 适用 |
+|---|---|---|
+| **`oldest`** | **最老录入优先（默认）** | 通用。官方赠送积分**会过期作废**，老号离到期最近，先用完它们 |
+| `remain` | 剩余最多优先 | 想让单号尽量多地承接请求 |
+| `lru` | 最久未用优先 | 纯粹想摊开流量 |
+| `weighted` | 三因子加权随机（见下） | 多账号长期跑，想概率倾斜 |
+
+**为什么默认从 `remain` 改成 `oldest`**：官方赠送/任务获得的积分**按批过期、不用作废**。
+实测某个账号 3950 积分里有 **3450（87%）30 天内就过期**。
+按「余额最多优先」会把流量持续压在新号上，老号的积分散在池子里等过期 ——
+这是实打实的浪费。`oldest` 的主键是 `created_at`，次级键是 `last_used_at`，
+因此会在老号之间**轮转**（实测连选 6 次命中 4 个不同账号），不会打死一个号。
+
+> **`weighted` 的「快过期先用」曾是失效的**：那个权重项依赖 `credits_expiring` 字段，
+> 而该字段此前**恒为 0**（没有任何地方写入）。现已由整点刷新任务从积分明细的
+> `deduction_end_ts` 统计「30 天内到期的剩余额度」写入，取不到时保留旧值不写 0。
+> 使用 `weighted` 前请确认该字段已有值，否则退化成纯余额加权。
+
+### 10.1.1 三因子加权 + Top-N 抽签（`weighted`）
+
+`ADMIN_ACCOUNT_SELECT=weighted` 时启用：
 
 ```text
 权重 = 1 + 余额/池内最高余额 × 10
@@ -1890,7 +2021,7 @@ cache miss     5.2 ms      每 30 秒最多一次
 
 | 问题 | 危害 | 修复 |
 |------|------|------|
-| `/api/growth/*` **整组无鉴权** | 匿名者可 `GET /api/growth/accounts/{id}/tasks` 从 `id=1` 递增枚举，拿到全部账号 UID 与**显示名**（实测泄露 `18022387641` 这类手机号）；`POST /run-async` 还能**真实启动批量任务、消耗账号积分并写库** | 整个 router 挂 `dependencies=[Depends(require_admin)]` |
+| `/api/growth/*` **整组无鉴权** | 匿名者可 `GET /api/growth/accounts/{id}/tasks` 从 `id=1` 递增枚举，拿到全部账号 UID 与**显示名**（实测泄露 `180****7641` 这类手机号）；`POST /run-async` 还能**真实启动批量任务、消耗账号积分并写库** | 整个 router 挂 `dependencies=[Depends(require_admin)]` |
 | `/gw/health` 无鉴权且回吐敏感字段 | 泄露服务器绝对路径、账号 UID、**手机号昵称**、积分余额 | 加 `_check_auth()`，且只回 `status/platform/python/credential_loaded` |
 | `/docs`、`/redoc`、`/openapi.json`、`/gw/docs`、`/gw/openapi.json` 公网开放 | 等于给攻击者一份现成的完整攻击面清单 —— **审计方正是靠 `/openapi.json` 里「这批路径鉴权参数为空」一眼定位到上面那条漏洞的** | 默认全部关闭（`ADMIN_ENABLE_DOCS=1` 才开） |
 | `/gw` 网关鉴权是「可选」的 | `converter._check_auth()` 是 `if not key: return` —— 只要漏配 `CONVERTER_API_KEY`，`/gw/v1/*` 全部接口对任何访问者开放，可任意白嫖额度。线上当时恰好配了，纯属运气 | **fail-closed**：没配 Key 就**拒绝挂载** `/gw`，而不是挂上去裸奔 |
@@ -1982,6 +2113,16 @@ cache miss     5.2 ms      每 30 秒最多一次
 - 后台一键拆包与路径自动补齐（`ADMIN_DEV_TOOLS`）；
 - `create_canvas` 的真实 id 口径与两段式状态机（`accept` → 完成 → `claim`）；
 - 全部测试（`test_pool.py` 548 项 / `test_e2e_db.py` / 网关冒烟 / 实测脚本）。
+
+### 技术支持（本项目是纯 vibe coding 产物）
+
+本项目的代码、排查过程与文档，都是在 **DeepSeek 模型 + DSH 智能体**的协作下直接产出的
+（人提需求与验收，智能体负责定位、实现与验证）。两个工具都是公开的，欢迎来玩：
+
+| 工具 | 角色 | 链接 |
+|------|------|------|
+| **DeepSeek 开放平台** | 提供模型能力（推理、写码、排查） | <https://platform.deepseek.com> |
+| **deepseek-harness（DSH）** | 搭配使用的智能体框架（读写文件、跑命令、自己验证） | <https://github.com/deepseek-ai/deepseek-harness> |
 
 ### 如果引用有误
 

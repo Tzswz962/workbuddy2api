@@ -101,8 +101,16 @@ class Settings:
     # 腾讯 CodeBuddy/WorkBuddy 后端通过 X-IDE-Name 头识别客户端，默认 "WorkBuddy"。
     UPSTREAM_CLIENT_NAME = os.getenv("ADMIN_UPSTREAM_CLIENT_NAME", "WorkBuddy")
 
-    # 账号选择策略：remain（剩余最多优先）/ lru（最久未用优先）/ weighted（三因子加权随机）
-    ACCOUNT_SELECT = os.getenv("ADMIN_ACCOUNT_SELECT", "remain")
+    # 账号选择策略：
+    #   oldest   最老录入优先（**默认**）—— 先用完老账号额度，避免积分过期作废
+    #   remain   剩余最多优先
+    #   lru      最久未用优先
+    #   weighted 三因子加权随机（余额 ×10 + 快过期 ×8 + 闲置补偿）
+    #
+    # 默认从 remain 改成 oldest：官方赠送积分**会过期作废**，老号离到期最近。
+    # 原来按余额最多选，会把流量持续压在新号上，老号的积分散在池子里等过期
+    # —— 用户的原话是「积分都快过期了为啥不先用」。
+    ACCOUNT_SELECT = os.getenv("ADMIN_ACCOUNT_SELECT", "oldest")
 
     # ---------- 开发 / 测试辅助工具 ----------
     #: 逆向产物（客户端源码）管理：后台一键拆包 app.asar、手动指定安装目录。

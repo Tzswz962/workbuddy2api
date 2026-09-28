@@ -231,6 +231,36 @@ class AccountSession:
     def fetch_balance(self) -> dict:
         return self.cm.fetch_balance()
 
+    def fetch_account_profile(self) -> dict:
+        """用**上游**取这个凭证对应的真实账号信息（uid / 昵称 / 手机号）。
+
+        用途：验证上传的凭证是不是伪造的。
+
+        `validate_credential` 只能证明「JWT 结构完整、字段齐全」——
+        这些字段全都可以手编（签名不验），所以必须让**上游**来回答
+        「这个令牌到底属于谁」。拿到真实 uid 后与凭证里声明的 uid 比对，
+        就能挡住「拿一份真凭证、把 account.uid 改成别的号」这种拼接伪造。
+
+        打的是 `/v2/plugin/accounts`。**实测确认**：该端点返回的账号完全由
+        Bearer 令牌决定 —— 把 `X-User-Id` 改空、改成别的 uid，返回的仍是
+        令牌自己的账号。所以它天然是可信的「令牌归属」来源，
+        而不是「按我们声明的 uid 去查」（那样验证就失去意义了）。
+        """
+        data = self.cm._request_backend("GET", "/v2/plugin/accounts")
+        accounts = ((data.get("data") or {}).get("accounts")) or []
+        if not accounts:
+            return {}
+        acc = accounts[0] or {}
+        return {
+            "uid": acc.get("uid") or "",
+            "nickname": acc.get("nickname") or "",
+            "uin": acc.get("uin") or "",
+            "type": acc.get("type") or "",
+            "phoneNumber": acc.get("phoneNumber") or "",
+            "enterpriseId": acc.get("enterpriseId") or "",
+            "enterpriseName": acc.get("enterpriseName") or "",
+        }
+
     def fetch_credit_details(self) -> list[dict]:
         """获取积分明细（每个积分包的总量/剩余/到期时间）。
 
@@ -582,14 +612,35 @@ class AccountSession:
         """批量参与任务。
 
         未参与（not_accepted）的任务不会累计进度，必须先 accept。
-        返回 {task_code: status}，status 为 accepted / already_accepted。
+
+        返回 `{task_code: status}`，status 为 `accepted` / `already_accepted` /
+        `error`。
+
+        ⚠️ **失败不抛异常**：上游在 HTTP 200 的信封里回
+        `{"status": "error", "message": "..."}`。所以调用方**必须**检查
+        status，只看有没有抛异常会把「参与失败」当成功 —— 后面照样发事件、
+        照样报成功，实际一个都没计入。
+
+        上游的 `message` 是排查的关键（实测它会直接告诉你原因，例如
+        `prerequisite not met: first_buddy (no buddy instance found)`），
+        这里顺手缓存下来供 `last_accept_message()` 取用。
         """
         res = self._growth("POST", "/v2/activity/growth/tasks/accept",
                            {"task_codes": list(task_codes)})
         if not res["ok"]:
             raise RuntimeError(f"参与任务失败: {res['msg']}")
-        return {r.get("task_code"): r.get("status")
-                for r in (res["data"].get("results") or [])}
+        out: dict[str, str] = {}
+        self._accept_msgs = {}
+        for r in (res["data"].get("results") or []):
+            code = r.get("task_code")
+            out[code] = r.get("status")
+            if r.get("message"):
+                self._accept_msgs[code] = str(r["message"])
+        return out
+
+    def last_accept_message(self, task_code: str) -> str:
+        """取上一次 `growth_accept` 里该任务的失败原因（没有则空串）。"""
+        return getattr(self, "_accept_msgs", {}).get(task_code, "")
 
     def growth_claim(self, task_code: str) -> dict:
         """领取单任务奖励。

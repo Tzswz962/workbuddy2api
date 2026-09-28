@@ -4,8 +4,22 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>WorkBuddy 共享管理后台</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.2/css/all.min.css" />
+  <!--
+    全部静态资源都走本地 /static/vendor/**，不再依赖任何 CDN。
+
+    为什么必须本地化：之前用 cdn.tailwindcss.com + cdn.jsdelivr.net，
+    结果网络一抖（实测 jsdelivr 直接超时），整站样式全崩 —— 图标变方块、
+    布局错乱，而后台是运维入口，越着急用的时候越可能网络不好。
+    现在断网也能正常打开。
+
+    tailwind 是**预编译好的静态 CSS**（不是运行时 JIT）：
+      * 体积更小、无 FOUC（不会先裸奔再套样式）；
+      * 不需要在浏览器里跑一个几百 KB 的 JS 去现算样式；
+      * 用 tailwind.config.js 的 content 指定源码 + safelist 兜底动态类。
+      重新生成方式见 docs/workbuddy-phone-login.md。
+  -->
+  <link rel="stylesheet" href="/static/vendor/tailwind/tailwind.min.css" />
+  <link rel="stylesheet" href="/static/vendor/fontawesome/css/all.min.css" />
   <style>
     :root{
       --wb-primary:#28b894; --wb-primary-d:#23a886;
@@ -198,6 +212,7 @@
           <button onclick="catTravelBatch()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="对全部账号执行：领养(+300) → 派猫 → 领奖"><i class="fa-solid fa-cat mr-1 text-pink-600"></i> 猫猫旅行</button>
           <button onclick="scanLocal()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-magnifying-glass mr-1"></i> 扫描本机</button>
           <button onclick="refreshAll()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-rotate mr-1"></i> 全部刷新</button>
+          <button onclick="openPhoneLogin()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="用手机号验证码登录，全自动完成授权并把凭证加入号池（无需安装客户端）"><i class="fa-solid fa-mobile-screen-button mr-1 text-emerald-600"></i> 手机号登录</button>
           <button onclick="openUpload()" class="text-sm px-3 py-1.5 rounded-lg btn-primary"><i class="fa-solid fa-file-import mr-1"></i> 批量上传</button>
           <button onclick="openExport()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="导出账号登录态（.info 原文），可直接再导入"><i class="fa-solid fa-file-export mr-1 text-sky-600"></i> 批量导出</button>
           <button onclick="openAddAccount()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-plus mr-1"></i> 单个添加</button>
@@ -1070,22 +1085,16 @@ function stopJobPoll() {
   if (_jobTimer) { clearInterval(_jobTimer); _jobTimer = null; }
 }
 
-/** 进度条 + 已完成列表的 HTML。 */
+/** 进度头部（文字 + 进度条 + 汇总）。**不含**账号列表。 */
 function jobProgressHtml(d, opts) {
   const pct = d.percent || 0;
   const done = d.status !== "running";
-  const rows = (d.items || []).map(x => {
-    const label = opts.label(x);
-    const detail = opts.detail(x);
-    const amount = opts.amount(x);
-    const icon = opts.icon(x);
-    return `<div class="flex items-center gap-2 py-1.5 border-b last:border-0">
-      ${icon}
-      <span class="flex-1 truncate">${esc(label)}</span>
-      <span class="text-slate-500 text-xs truncate max-w-[45%]">${esc(detail)}</span>
-      ${amount}
-    </div>`;
-  }).join("") || `<div class="text-slate-400 text-xs py-2">等待第一个账号完成...</div>`;
+  // 细粒度进度：当前账号已完成几个任务。
+  // 一个账号要跑十几个任务、几分钟，只有账号级进度时界面会长时间不动，
+  // 用户以为卡死了 —— 所以要显示「本账号已完成 N 个任务」。
+  const taskBit = (!done && d.task_done)
+    ? ` <span class="text-slate-400 font-normal text-xs">· 本账号已完成 ${d.task_done} 个任务</span>`
+    : "";
 
   const head = done
     ? `<div class="mb-2 font-semibold ${d.status === "failed" ? "text-red-500" : "text-emerald-600"}">
@@ -1097,7 +1106,7 @@ function jobProgressHtml(d, opts) {
        </div>
        ${d.current ? `<div class="text-xs text-slate-500 mb-2">
            <i class="fa-solid fa-circle-notch fa-spin mr-1 text-sky-500"></i>
-           正在处理 <b class="text-slate-700">${esc(d.current)}</b>
+           正在处理 <b class="text-slate-700">${esc(d.current)}</b>${taskBit}
          </div>` : ""}`;
 
   return `${head}
@@ -1105,15 +1114,57 @@ function jobProgressHtml(d, opts) {
       <div class="h-full rounded-full transition-all duration-300 ${done ? "bg-emerald-500" : "bg-sky-500"}"
            style="width:${pct}%"></div>
     </div>
-    ${done ? `<div class="text-xs text-slate-500 mb-2">${opts.summaryHtml ? opts.summaryHtml(d) : ""}</div>` : ""}
-    <div class="rounded-lg border bg-slate-50 px-3 py-1 max-h-72 overflow-auto">${rows}</div>`;
+    ${done ? `<div class="text-xs text-slate-500 mb-2">${opts.summaryHtml ? opts.summaryHtml(d) : ""}</div>` : ""}`;
+}
+
+/** 已完成账号列表（**单独一块**，便于局部更新、不整块闪烁）。 */
+function jobProgressRows(d, opts) {
+  return (d.items || []).map(x => {
+    const label = opts.label(x);
+    const detail = opts.detail(x);
+    const amount = opts.amount(x);
+    const icon = opts.icon(x);
+    return `<div class="flex items-center gap-2 py-1.5 border-b last:border-0">
+      ${icon}
+      <span class="flex-1 truncate">${esc(label)}</span>
+      <span class="text-slate-500 text-xs truncate max-w-[45%]">${esc(detail)}</span>
+      ${amount}
+    </div>`;
+  }).join("") || `<div class="text-slate-400 text-xs py-2">等待第一个账号完成...</div>`;
+}
+
+/**
+ * 局部更新进度：**只替换真正变了的那部分**。
+ *
+ * 为什么不能用 `innerHTML = jobProgressHtml(...)`：那样每 1.5 秒把整块
+ * DOM（含滚动位置、hover 状态、CSS 过渡）全部销毁重建，视觉上就是
+ * 「卡片一直在闪」。这里把头部与列表拆成两个固定容器，分别比对内容，
+ * 只有内容真的变了才写 —— 列表没变就完全不动它，滚动条也不会跳回顶部。
+ */
+function updateJobProgress(d, opts) {
+  const head = $("#jobHead");
+  const list = $("#jobList");
+  if (!head || !list) return;
+  const headHtml = jobProgressHtml(d, opts);
+  if (head.dataset.sig !== headHtml) {
+    head.innerHTML = headHtml;
+    head.dataset.sig = headHtml;
+  }
+  const listHtml = jobProgressRows(d, opts);
+  if (list.dataset.sig !== listHtml) {
+    list.innerHTML = listHtml;
+    list.dataset.sig = listHtml;
+  }
 }
 
 /** 提交后台任务并开始轮询进度。 */
 async function runJob(opts) {
   stopJobPoll();
+  // 两个**固定容器**：轮询时只更新它们的内容，不重建整块 DOM。
+  // 整块重建会让列表每 1.5 秒消失再出现 —— 就是「卡片闪来闪去」的原因。
   openModal(`<h3 class="font-bold mb-1">${opts.iconHtml || ""} ${esc(opts.title)}</h3>
-    <div id="jobBody" class="text-sm text-slate-500">正在提交...</div>
+    <div id="jobHead" class="text-sm text-slate-500">正在提交...</div>
+    <div id="jobList" class="rounded-lg border bg-slate-50 px-3 py-1 max-h-72 overflow-auto text-sm"></div>
     <div class="flex justify-end gap-2 mt-4">
       <button onclick="stopJobPoll(); closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button>
     </div>`);
@@ -1126,17 +1177,17 @@ async function runJob(opts) {
     });
     const j = await safeJson(r);
     if (!r.ok) {
-      $("#jobBody").innerHTML = `<span class="text-red-500">提交失败: ${esc(j.data?.detail || "未知错误")}</span>`;
+      $("#jobHead").innerHTML = `<span class="text-red-500">提交失败: ${esc(j.data?.detail || "未知错误")}</span>`;
       return;
     }
     d = j.data;
   } catch (e) {
-    $("#jobBody").innerHTML = `<span class="text-red-500">提交异常: ${esc(String(e))}</span>`;
+    $("#jobHead").innerHTML = `<span class="text-red-500">提交异常: ${esc(String(e))}</span>`;
     return;
   }
 
   if (d.reused) toast("已有批量任务在执行，显示其进度", "ok");
-  $("#jobBody").innerHTML = jobProgressHtml(d, opts);
+  updateJobProgress(d, opts);
 
   _jobTimer = setInterval(async () => {
     try {
@@ -1144,9 +1195,8 @@ async function runJob(opts) {
       const j = await safeJson(r);
       if (!r.ok || !j.data) return;
       const cur = j.data;
-      const box = $("#jobBody");
-      if (!box) { stopJobPoll(); return; }   // 弹窗被关掉了
-      box.innerHTML = jobProgressHtml(cur, opts);
+      if (!$("#jobHead")) { stopJobPoll(); return; }   // 弹窗被关掉了
+      updateJobProgress(cur, opts);
       if (cur.status !== "running") {
         stopJobPoll();
         if (cur.status === "failed") toast("批量执行失败：" + (cur.error || ""), "err");
@@ -1279,8 +1329,8 @@ function renderGrowthTasks(d){
       <td class="px-3 py-2 text-amber-600 font-medium">${t.reward_credit || 0}</td>
       <td class="px-3 py-2 text-xs text-slate-400 max-w-[16rem]">${esc(t.strategy || "")}</td>
       <td class="px-3 py-2 text-right whitespace-nowrap">
-        ${canClaim ? `<button onclick="growthDoClaim(${d.account_id},'${esc(t.task_code)}')" class="text-xs px-2 py-1 rounded border border-amber-300 text-amber-700 hover:bg-amber-50">领奖</button>` : ""}
-        ${canRun ? `<button onclick="growthDoRun(${d.account_id},'${esc(t.task_code)}')" class="text-xs px-2 py-1 rounded border border-emerald-300 text-emerald-700 hover:bg-emerald-50 ml-1">完成</button>` : ""}
+        ${canClaim ? `<button onclick="growthDoClaim(${d.account_id},'${esc(t.task_code)}',this)" class="text-xs px-2 py-1 rounded border border-amber-300 text-amber-700 hover:bg-amber-50">领奖</button>` : ""}
+        ${canRun ? `<button onclick="growthDoRun(${d.account_id},'${esc(t.task_code)}',this)" class="text-xs px-2 py-1 rounded border border-emerald-300 text-emerald-700 hover:bg-emerald-50 ml-1">完成</button>` : ""}
       </td>
     </tr>`;
   }).join("");
@@ -1296,10 +1346,10 @@ function renderGrowthTasks(d){
       等级 ${(d.profile && d.profile.level) || "-"} · 已自动完成 ${s.actionable || 0} 个可自动化任务
     </div>
     <div class="flex flex-wrap gap-2 mb-3">
-      <button onclick="growthDoRun(${d.account_id})" ${runnable.length ? "" : "disabled"}
+      <button onclick="growthDoRun(${d.account_id},null,this)" ${runnable.length ? "" : "disabled"}
         class="text-sm px-3 py-1.5 rounded-lg border border-emerald-300 text-emerald-700 hover:bg-emerald-50 disabled:opacity-40 disabled:cursor-not-allowed">
         <i class="fa-solid fa-bolt mr-1"></i> 完成可自动化任务 (${runnable.length})</button>
-      <button onclick="growthDoClaim(${d.account_id})" ${claimable.length ? "" : "disabled"}
+      <button onclick="growthDoClaim(${d.account_id},null,this)" ${claimable.length ? "" : "disabled"}
         class="text-sm px-3 py-1.5 rounded-lg border border-amber-300 text-amber-700 hover:bg-amber-50 disabled:opacity-40 disabled:cursor-not-allowed">
         <i class="fa-solid fa-gift mr-1"></i> 领取全部奖励 (${claimable.length})</button>
       <button onclick="growthTasks(${d.account_id},'${esc(d.name || "")}')" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50">
@@ -1325,66 +1375,119 @@ function renderGrowthTasks(d){
     </div>`;
 }
 
-/* 执行任务（taskCode 为空 = 全部可自动化任务） */
-async function growthDoRun(id, taskCode){
+/* ==========================================================================
+   按钮「加载中」态（防呆 + 让用户知道要等）
+   --------------------------------------------------------------------------
+   之前的问题：点「执行」后按钮**毫无变化**，也没有防重复点击。
+   而单账号跑一轮要几分钟 —— 用户只能对着一个没反应的按钮猜，
+   于是以为卡死，还会反复点（叠出更多请求）。
+   这里统一：立刻禁用 + 转圈 + 显示已用秒数。
+   ========================================================================== */
+
+/** 按钮进入「加载中」，返回一个 restore 函数（务必在 finally 里调用）。 */
+function btnBusy(btn, text) {
+  if (!btn) return () => {};
+  const html = btn.innerHTML;
+  const wasDisabled = btn.disabled;
+  btn.dataset.busy = "1";
+  btn.disabled = true;
+  btn.classList.add("opacity-60", "cursor-not-allowed");
+  const t0 = Date.now();
+  const render = () => {
+    const s = Math.floor((Date.now() - t0) / 1000);
+    // 显示秒数：用户能看出「在动」，也能大致判断还要等多久
+    btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-1"></i>${esc(text)}${s ? " " + s + "s" : ""}`;
+  };
+  render();
+  const timer = setInterval(render, 1000);
+  return () => {
+    clearInterval(timer);
+    btn.dataset.busy = "";
+    btn.disabled = wasDisabled;
+    btn.classList.remove("opacity-60", "cursor-not-allowed");
+    btn.innerHTML = html;
+  };
+}
+
+/** 是否正在忙（防呆：重复点击直接忽略）。 */
+function btnIsBusy(btn) {
+  return !!(btn && btn.dataset && btn.dataset.busy === "1");
+}
+
+/* 执行任务（taskCode 为空 = 全部可自动化任务）
+   走**异步接口 + 进度弹窗**：单账号十几个任务要跑几分钟，
+   同步接口只会让用户对着一个没有反馈的按钮干等，还会撞 nginx 60s 超时。 */
+async function growthDoRun(id, taskCode, btn){
+  if (btnIsBusy(btn)) return;          // 防呆：已在执行就别再点一次
   const label = taskCode ? `任务 ${taskCode}` : "全部可自动化任务";
   if (!await uiConfirm({kind:"info", danger:false, title:"执行成长任务",
-      message:`确认对账号执行「${label}」？\n将自动参与并触发完成，随后可领奖。`,
+      message:`确认对账号执行「${label}」？\n将自动参与并触发完成，随后自动领奖。\n（单账号可能需要几分钟，可关闭弹窗，后台继续执行）`,
       okText:"开始执行"})) return;
 
-  toast("执行中，请稍候...", "ok");
+  const restore = btnBusy(btn, "执行中");
   try {
-    const r = await api("/api/growth/run", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ account_ids: [id], task_codes: taskCode ? [taskCode] : null }),
+    await runJob({
+      title: "执行成长任务",
+      iconHtml: '<i class="fa-solid fa-seedling mr-1 text-emerald-600"></i>',
+      submitUrl: "/api/growth/run-async",
+      body: { account_ids: [id], task_codes: taskCode ? [taskCode] : null },
+      label: x => x.name || x.account_id,
+      detail: x => {
+        if (!x.ok) return x.skipped || x.msg || "失败";
+        if (x.noop) return x.noop_reason || "无可做任务";
+        const done = (x.tasks || []).filter(t => t.ok && !t.skipped).length;
+        const skipped = (x.tasks || []).filter(t => t.skipped).length;
+        return done ? `完成 ${done} 个任务` + (skipped ? `，跳过 ${skipped}` : "")
+                    : `跳过 ${skipped} 个`;
+      },
+      amount: x => (x.credit > 0)
+        ? `<span class="font-semibold text-amber-600 shrink-0">+${x.credit}</span>` : "",
+      icon: x => (x.credit > 0)
+        ? '<i class="fa-solid fa-circle-check text-emerald-500 shrink-0"></i>'
+        : x.ok ? '<i class="fa-solid fa-minus-circle text-slate-400 shrink-0"></i>'
+               : '<i class="fa-solid fa-circle-xmark text-red-500 shrink-0"></i>',
+      doneText: d => {
+        const r = (d.items || [])[0] || {};
+        const c = r.credit || 0;
+        return c > 0 ? `完成，获得 ${c} 积分` : "执行完成";
+      },
+      summaryHtml: d => {
+        const r = (d.items || [])[0] || {};
+        const parts = [];
+        const done = (r.tasks || []).filter(t => t.ok && !t.skipped).length;
+        if (done) parts.push(`完成 <b>${done}</b> 个任务`);
+        if (r.credit) parts.push(`<b class="text-amber-600">+${r.credit} 积分</b>`);
+        if (r.energy) parts.push(`+${r.energy} 能量`);
+        if (r.balance_remain != null) {
+          parts.push(`余额 <b>${r.balance_remain}/${r.balance_total}</b>`);
+        }
+        // 跳过/失败要说清原因，否则只有「完成 0 个」像执行失败
+        const blocked = (r.tasks || []).filter(t => !t.ok && !t.skipped);
+        if (blocked.length) {
+          parts.push(`<span class="text-red-600">${blocked.length} 个未完成</span>`);
+        }
+        return parts.join(" · ") || "执行完成";
+      },
+      doneToast: d => {
+        const r = (d.items || [])[0] || {};
+        return r.credit > 0 ? `执行完成，获得 ${r.credit} 积分` : "执行完成";
+      },
+      // 完成后刷新列表（余额）**并**刷新任务弹窗 —— 用户反馈「完成之后没刷新」
+      onFinish: () => {
+        loadAccounts();
+        const cur = window._growthTaskAccount;
+        if (cur === id) growthTasks(id, "");
+      },
     });
-    const { ok, data: d } = await safeJson(r);
-    if (!r.ok) { toast("执行失败: " + (d.detail || "未知错误"), "err"); return; }
-    const a = (d.results || [])[0] || {};
-    const lines = (a.tasks || []).map(t => {
-      const icon = t.skipped ? '<i class="fa-solid fa-minus-circle text-slate-400"></i>'
-                             : t.ok ? '<i class="fa-solid fa-circle-check text-emerald-500"></i>'
-                                    : '<i class="fa-solid fa-circle-xmark text-red-500"></i>';
-      const note = t.skipped ? esc(t.skipped)
-                             : `触发 ${t.fired}/${t.times} 次 · ${esc(t.progress || "")} ${esc(t.status || "")}`;
-      return `<div class="flex items-center gap-2 py-1.5 border-b last:border-0">
-                ${icon}<span class="flex-1">${esc(t.title || t.task_code)}</span>
-                <span class="text-xs text-slate-500">${note}</span></div>`;
-    }).join("") || '<div class="text-slate-400 py-2">没有可自动完成的任务</div>';
-
-    // 完成任务后自动领奖，形成闭环
-    let claimMsg = "";
-    try {
-      const r2 = await api("/api/growth/claim", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ account_ids: [id] }),
-      });
-      const { data: d2 } = await safeJson(r2);
-      const a2 = (d2.results || [])[0] || {};
-      if (a2.total_credit > 0) claimMsg = `，并自动领取 ${a2.total_credit} 积分`;
-    } catch(e){}
-
-    const usedModels = [...new Set((a.tasks || []).map(t => t.model).filter(Boolean))];
-    const modelNote = usedModels.length
-      ? `模型：${esc(d.model || "-")}（免费）· 指定模型：${esc(usedModels.join(", "))}`
-      : `使用模型 ${esc(d.model || "-")}（免费 0 倍率，成本为 0）`;
-
-    openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-seedling mr-1 text-emerald-600"></i> 执行结果</h3>
-      <p class="text-xs text-slate-400 mb-3">${modelNote}</p>
-      <div class="rounded-lg border bg-slate-50 px-3 py-1 max-h-72 overflow-auto">${lines}</div>
-      <div class="flex justify-end gap-2 mt-4">
-        <button onclick="growthTasks(${id},'')" class="px-3 py-1.5 rounded-lg border text-sm">查看任务</button>
-        <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg btn-primary text-sm">知道了</button>
-      </div>`);
-    toast("任务执行完成" + claimMsg, "ok");
-    loadAccounts();
-  } catch (e) {
-    toast("执行异常: " + String(e), "err");
+  } finally {
+    restore();
   }
 }
 
 /* 领取奖励（taskCode 为空 = 所有已完成待领取） */
-async function growthDoClaim(id, taskCode){
+async function growthDoClaim(id, taskCode, btn){
+  if (btnIsBusy(btn)) return;
+  const restore = btnBusy(btn, "领取中");
   try {
     const r = await api("/api/growth/claim", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -1394,15 +1497,23 @@ async function growthDoClaim(id, taskCode){
     if (!r.ok) { toast("领取失败: " + (d.detail || "未知错误"), "err"); return; }
     const a = (d.results || [])[0] || {};
     const got = a.total_credit || 0;
-    if (got > 0) toast(`领取成功，获得 ${got} 积分`, "ok");
-    else if ((a.claimed || []).every(c => c.already)) toast("奖励此前已领取", "ok");
+    if (got > 0) {
+      // 带上刷新后的余额，用户能立刻看到「积分确实到账了」
+      const bal = (a.balance_remain != null)
+        ? `，当前余额 ${a.balance_remain}/${a.balance_total}` : "";
+      toast(`领取成功，获得 ${got} 积分${bal}`, "ok");
+    }
+    else if ((a.claimed || []).length && (a.claimed || []).every(c => c.already))
+      toast("奖励此前已领取", "ok");
     else toast("没有可领取的奖励", "ok");
     loadAccounts();
-    // 刷新弹窗内容
+    // 刷新弹窗内容（列表里的状态/余额要跟着变）
     const cur = window._growthTaskAccount;
     if (cur === id) growthTasks(id, "");
   } catch (e) {
     toast("领取异常: " + String(e), "err");
+  } finally {
+    restore();
   }
 }
 
@@ -1719,11 +1830,163 @@ async function refreshAll(){
   toast("全部刷新完成"); loadAccounts();
 }
 
+/* ==================== 手机号登录（全自动授权换凭证） ====================
+ * 与「批量上传」的区别：这里不需要用户手上有 .info 文件，
+ * 应用户手机号 + 验证码，由**服务端**完成整条 auth 授权并把凭证直接入库。
+ * 全程不需要安装 WorkBuddy 客户端，手机浏览器也能走完。
+ */
+let _plSid = "", _plTimer = null, _plCountdown = 0;
+
+function openPhoneLogin(){
+  if(_plTimer){ clearInterval(_plTimer); _plTimer = null; }
+  _plSid = "";
+  openModal(`
+    <h3 class="font-bold mb-1"><i class="fa-solid fa-mobile-screen-button mr-1 text-emerald-600"></i> 手机号登录</h3>
+    <p class="text-xs text-slate-500 mb-4">输入手机号获取验证码。登录成功后系统会自动完成授权，把凭证加入账号池；<b>无需安装客户端</b>。</p>
+
+    <div id="plStep1">
+      <label class="text-xs text-slate-500">手机号</label>
+      <div class="flex gap-2 mt-1">
+        <span class="px-3 py-2 rounded-lg bg-slate-100 text-sm text-slate-500 shrink-0">+86</span>
+        <input id="plMobile" type="tel" inputmode="numeric" maxlength="11" placeholder="11 位手机号"
+               class="flex-1 border rounded-lg px-3 py-2 text-sm font-mono" />
+      </div>
+      <div class="flex justify-end gap-2 mt-4">
+        <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">取消</button>
+        <button id="plSendBtn" onclick="plSend()" class="px-3 py-1.5 rounded-lg btn-primary">获取验证码</button>
+      </div>
+    </div>
+
+    <div id="plStep2" class="hidden">
+      <label class="text-xs text-slate-500">验证码</label>
+      <div class="flex gap-2 mt-1">
+        <input id="plCode" type="tel" inputmode="numeric" maxlength="6" placeholder="6 位验证码"
+               class="flex-1 border rounded-lg px-3 py-2 text-sm font-mono tracking-widest" />
+        <button id="plResendBtn" onclick="plSend()" class="px-3 py-1.5 rounded-lg border text-sm shrink-0 whitespace-nowrap" disabled>重新获取</button>
+      </div>
+      <p id="plHint" class="text-xs text-slate-400 mt-2"></p>
+      <div class="flex justify-end gap-2 mt-4">
+        <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">取消</button>
+        <button id="plVerifyBtn" onclick="plVerify()" class="px-3 py-1.5 rounded-lg btn-primary">登录并上传</button>
+      </div>
+    </div>
+
+    <div id="plStep3" class="hidden text-center py-4">
+      <div id="plResultIcon" class="text-4xl mb-2"></div>
+      <div id="plResultMsg" class="text-sm"></div>
+      <div class="flex justify-center gap-2 mt-4">
+        <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button>
+      </div>
+    </div>`, "max-w-md");
+  setTimeout(() => { const el = $("#plMobile"); if(el) el.focus(); }, 60);
+}
+
+/* 发起会话（拿 sid）。发码前必须先有 sid —— 整条授权链绑定在它上面。 */
+async function plStart(){
+  const r = await api("/api/login/start", { method: "POST" });
+  const { ok, data } = await safeJson(r);
+  if(!ok || !data.sid){
+    throw new Error((data.detail && (data.detail.message || data.detail)) || "发起登录失败");
+  }
+  _plSid = data.sid;
+  return data.sid;
+}
+
+function plStartCountdown(sec){
+  _plCountdown = sec;
+  const btn = $("#plResendBtn");
+  if(_plTimer) clearInterval(_plTimer);
+  const tick = () => {
+    const b = $("#plResendBtn");
+    if(!b) { clearInterval(_plTimer); return; }
+    if(_plCountdown <= 0){
+      clearInterval(_plTimer); _plTimer = null;
+      b.disabled = false; b.textContent = "重新获取";
+      return;
+    }
+    b.disabled = true; b.textContent = _plCountdown + "s";
+    _plCountdown--;
+  };
+  tick();
+  _plTimer = setInterval(tick, 1000);
+}
+
+async function plSend(){
+  const mobile = ($("#plMobile").value || "").replace(/\D/g, "");
+  if(!/^1[3-9]\d{9}$/.test(mobile)){ toast("请输入正确的 11 位手机号", "err"); return; }
+  const btn = $("#plSendBtn") || $("#plResendBtn");
+  if(btn) btn.disabled = true;
+  try {
+    if(!_plSid) await plStart();
+    const r = await api("/api/login/send", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sid: _plSid, mobile })
+    });
+    const { ok, data } = await safeJson(r);
+    if(!ok){
+      const d = data.detail;
+      const msg = (d && (d.message || d)) || "发送失败";
+      // 会话可能已过期（超时/已消费）→ 清掉，下次点击自动重开
+      if(d && d.step === "session") _plSid = "";
+      toast(String(msg), "err");
+      if(btn) btn.disabled = false;
+      return;
+    }
+    $("#plStep1").classList.add("hidden");
+    $("#plStep2").classList.remove("hidden");
+    $("#plHint").textContent = "验证码已发送至 " + mobile + "，请查看短信（60 秒内有效）";
+    plStartCountdown(60);
+    setTimeout(() => { const el = $("#plCode"); if(el) el.focus(); }, 60);
+  } catch(e){
+    toast(String(e.message || e), "err");
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function plVerify(){
+  const code = ($("#plCode").value || "").replace(/\D/g, "");
+  if(code.length !== 6){ toast("请输入 6 位验证码", "err"); return; }
+  if(!_plSid){ toast("会话已失效，请重新获取验证码", "err"); return; }
+  const btn = $("#plVerifyBtn");
+  if(btn){ btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> 登录中…'; }
+  try {
+    const r = await api("/api/login/verify", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sid: _plSid, code })
+    });
+    const { ok, data } = await safeJson(r);
+    $("#plStep2").classList.add("hidden");
+    $("#plStep3").classList.remove("hidden");
+    if(ok){
+      // 上游验证结果一并展示：既证明凭证真实可用，也让「积分/账号名」
+      // 直接来自腾讯侧的事实（而不是凭证里那个可能被改过的 account 字段）
+      const ck = data.check || {};
+      $("#plResultIcon").innerHTML = '<i class="fa-solid fa-circle-check text-emerald-500"></i>';
+      $("#plResultMsg").innerHTML = `<div class="font-medium text-emerald-700">${esc(data.message || "登录成功")}</div>
+        <div class="text-slate-500 mt-1 text-xs">账号：${esc((data.account && data.account.name) || "-")}${data.uid ? " · UID " + esc(data.uid) : ""}</div>
+        ${ck.live_message ? `<div class="text-emerald-600 mt-1 text-xs"><i class="fa-solid fa-shield-halved mr-1"></i>${esc(ck.live_message)}</div>` : ""}`;
+      if(_plTimer){ clearInterval(_plTimer); _plTimer = null; }
+      loadAccounts();
+    } else {
+      const d = data.detail;
+      const msg = (d && (d.message || d)) || "登录失败";
+      $("#plResultIcon").innerHTML = '<i class="fa-solid fa-circle-xmark text-red-500"></i>';
+      $("#plResultMsg").innerHTML = `<div class="text-red-600">${esc(String(msg))}</div>`;
+    }
+  } catch(e){
+    $("#plStep2").classList.add("hidden");
+    $("#plStep3").classList.remove("hidden");
+    $("#plResultIcon").innerHTML = '<i class="fa-solid fa-circle-xmark text-red-500"></i>';
+    $("#plResultMsg").innerHTML = `<div class="text-red-600">${esc(String(e.message || e))}</div>`;
+  }
+}
+
 /* 批量上传 */
 function openUpload(){
   openModal(`
     <h3 class="font-bold mb-3"><i class="fa-solid fa-file-import mr-1"></i> 批量上传账号</h3>
     <p class="text-xs text-slate-500 mb-2">粘贴多个 WorkBuddy 登录态（.info 原文）。支持：①一个 JSON 数组；②每行一个 JSON 对象。也可选择本地 .info 文件。</p>
+    <p class="text-xs text-amber-600 mb-2"><i class="fa-solid fa-shield-halved mr-1"></i>每条都会调真实上游接口验证是否可用，<b>伪造的凭证会被拒收</b>（因此上传略慢，属正常）。</p>
     <textarea id="upText" class="w-full border rounded-lg p-2 text-xs h-40 font-mono" placeholder='{"auth":{...},"account":{...}}'></textarea>
     <input id="upFile" type="file" accept=".info,.json" multiple class="mt-2 text-sm" />
     <div class="flex justify-end gap-2 mt-4">
