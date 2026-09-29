@@ -640,6 +640,72 @@ python -m uvicorn admin.server:app --host 0.0.0.0 --port 8790
 
 `scripts/` 之外，根目录 `sync_auth.py` + `sync_auth.bat`：把本机最新桌面端登录态同步到服务器（依赖 managed python 的 paramiko），双击 `sync_auth.bat` 即可。
 
+### 4.4.1 守护：宕机自动拉起（`scripts/watchdog.sh`）
+
+**为什么必须有它**：`main.py` 的设计是「**子进程死 → 整体退出**」
+（为了不留孤儿进程）。好处是干净，代价是**任何一个子进程被意外杀死，
+整个服务就停了**。而线上内存常年吃紧，内核 OOM 会挑进程下手 ——
+真实事故就是这么发生的：
+
+```text
+2026-09-29 03:36  系统 dnf-makecache 刷元数据 → 全机 OOM
+                  内核杀掉 uvicorn（PID 3714458）
+03:36             main.py 检测到子进程死 → 自己也退出
+03:38 → 07:05     服务不可用 3.5 小时，等人工重启
+```
+
+**为什么以前没兜住**：看门狗**一直在正常触发**（cron 每 2 分钟），
+健康检测逻辑也对，但每次都失败在同一行：
+
+```bash
+line 86: runuser: command not found
+```
+
+根因是脚本没声明 `PATH`：cron 给的 PATH 极简（实测
+`/usr/local/bin:/usr/bin`），**不含 `/usr/sbin`**，而 `runuser` 恰恰在
+`/usr/sbin/runuser`。于是 113 次重试全废（2026-09-26 也有同样 8 次）。
+**看门狗从上线起就没真正生效过。**
+
+**安装**（root，路径按需调整）：
+
+```bash
+install -m 755 scripts/watchdog.sh \
+    /www/server/python_project/vhost/scripts/workbuddy2api_watchdog.sh
+
+crontab -e
+# 追加：
+*/2 * * * * /www/server/python_project/vhost/scripts/workbuddy2api_watchdog.sh >/dev/null 2>&1
+```
+
+**装完务必实测**（不测等于没装 —— 这正是上次的教训）：
+
+```bash
+pkill -f 'admin.server:app'; pkill -f 'python main.py'   # 模拟宕机
+bash /www/server/python_project/vhost/scripts/workbuddy2api_watchdog.sh
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8790/admin   # 期望 200
+tail -5 /www/wwwlogs/python/workbuddy2api/watchdog.log                 # 期望「重启成功」
+```
+
+**脚本做了什么**：
+
+| 机制 | 说明 |
+|------|------|
+| **显式 PATH** | 文件头第一件事就是 `export PATH=...`，含 `/usr/sbin`（这条修复就是全部问题的根因） |
+| **`runuser` 绝对路径** | 双保险，即便 PATH 又被改坏也能拉起 |
+| **健康判定用真实 HTTP** | 而不是「进程存在」—— 进程活着但事件循环卡死时，nginx 侧同样是 502/504 |
+| **OOM 保护** | 把服务调成 `oom_score_adj=-500`（最后才被杀）。只有 root 能设负值，所以放在这个脚本里；**反复扫描整棵进程树**，因为 `uvicorn` 是约 1 秒后才 fork 的，而该值在 fork 时继承 —— 只设一次会漏掉真正吃内存的那个 |
+| **`flock` 防重叠** | 上一轮没跑完时，cron 的下一轮直接退出 |
+| **降权到 `www`** | 服务不该以 root 运行（一旦被攻破就是整机沦陷） |
+| **只动本项目进程** | 按「工作目录 = 项目路径」校验，避免误杀同机其它 python 服务 |
+
+所有路径都能用环境变量覆盖（`WB_PROJ` / `WB_PY` / `WB_PORT` / `WB_RUN_USER`
+/ `WB_OOM_ADJ` …），换机器或换 Python 版本不必改脚本正文。
+
+> **注意：这只是「兜住」，不是「修好」。** 服务仍会在内存尖峰时被杀，
+> 只是能自动起来（中断约 2 分钟而非 3.5 小时）。
+> 根治要**加内存**（本机仅 1870 MB 且 swap 常年 100% 满）
+> 或给主机加 swap。
+
 ### 4.5 Docker
 
 容器拿不到桌面端 auth 文件，需把宿主机登录态目录挂进去。改 `docker-compose.yml` 里的 auth 挂载路径后：
