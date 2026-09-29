@@ -943,6 +943,80 @@ class StreamDeltaNormalizer:
         return f"{lead}data: {json.dumps(obj, ensure_ascii=False)}{cr}"
 
 
+class StreamCommitBuffer:
+    """上游流式响应的「提交前缓冲」：确认拿到正文前先攒着，之后直通。
+
+    为什么需要它：网关只有在确认这是**真正文**（而不是 200 包着的错误信封）之后，
+    才允许把字节发给客户端 —— 一旦发出就再也无法换号重试了。
+
+    为什么要单独成类：这段逻辑原先内联在路由函数里，并且犯过一次严重的类型错误
+    （把 :class:`StreamDeltaNormalizer` 返回的 **bytes** 塞进 ``list[str]`` 再
+    ``"".join()``），导致每个流式请求在出现第一段正文时抛 TypeError；又因为外层
+    ``except Exception`` 在 ``delivered=True`` 时只静默结束，日志里连堆栈都没有，
+    最终表现为 nginx「upstream prematurely closed connection」+ 客户端
+    「Stream ended without finish_reason」。
+
+    所以这里把缓冲逻辑收拢到一处，并**全程只用 bytes**（不再有 str/bytes 混用），
+    便于单测覆盖。接口：
+
+        feed_text(text)  -> bytes   喂入一段文本，返回**现在就该转发**的字节
+        commit()         -> bytes   提交：返回此前攒下的全部字节
+        flush()          -> bytes   流结束：返回需要立即转发的尾部字节
+        take_pending()   -> bytes   取出尚未转发的字节（兜底补发用）
+    """
+
+    __slots__ = ("_normalizer", "_pending", "committed")
+
+    def __init__(self, normalizer: "StreamDeltaNormalizer | None" = None) -> None:
+        self._normalizer = normalizer
+        self._pending = b""
+        self.committed = False
+
+    @property
+    def normalizer(self) -> "StreamDeltaNormalizer | None":
+        return self._normalizer
+
+    def feed_text(self, text: str) -> bytes:
+        """喂入一段文本。提交前返回 ``b""``（同时攒着），提交后原样返回。"""
+        if not text:
+            return b""
+        raw = text.encode("utf-8")
+        clean = self._normalizer.feed(raw) if self._normalizer is not None else raw
+        if self.committed:
+            return clean
+        self._pending += clean
+        return b""
+
+    def commit(self) -> bytes:
+        """标记已提交，并返回此前攒下的全部字节。"""
+        self.committed = True
+        out = self._pending
+        self._pending = b""
+        return out
+
+    def flush(self) -> bytes:
+        """流结束。已提交则返回归一器残留（需立即转发）；否则并入 pending。"""
+        if self._normalizer is None:
+            return b""
+        tail = self._normalizer.flush()
+        if not tail:
+            return b""
+        if self.committed:
+            return tail
+        self._pending += tail
+        return b""
+
+    def take_pending(self) -> bytes:
+        """取出尚未转发的字节（用于「始终没识别到正文」的兜底补发）。"""
+        out = self._pending
+        self._pending = b""
+        return out
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self._pending)
+
+
 # ---------------------------------------------------------------------------
 # 10. 统一入口
 # ---------------------------------------------------------------------------

@@ -119,15 +119,16 @@ except Exception:  # pragma: no cover - 降级分支
     _DESENSITIZE_AVAILABLE = False
     desensitize_body = None
 
-# 上游流式 delta 的「空占位字段」归一（tool_calls:[] / function_call:null 等）。
-# 这些空值会被一部分客户端误判成「工具调用开始」，把一次思考切成几十上百块。
-# 与 converter 的 /gw 端点共用同一实现，避免两处行为漂移。
+# 上游流式 delta 的「空占位字段」归一（tool_calls:[] / function_call:null 等），
+# 外加「提交前缓冲」封装。这些空值会被一部分客户端误判成「工具调用开始」，
+# 把一次思考切成几十上百块。与 converter 的 /gw 端点共用同一实现，避免两处行为漂移。
 try:
-    from upstream_compat import StreamDeltaNormalizer
+    from upstream_compat import StreamCommitBuffer, StreamDeltaNormalizer
     _STREAM_NORMALIZER_AVAILABLE = True
 except Exception:  # pragma: no cover - 降级分支
     _STREAM_NORMALIZER_AVAILABLE = False
     StreamDeltaNormalizer = None
+    StreamCommitBuffer = None
 
 router = APIRouter(tags=["proxy"])
 
@@ -2051,30 +2052,35 @@ async def chat_completions(
                                 final_uid = acc_i.uid or "-"
                                 probe = ""
                                 committed = False
-                                # 空占位字段归一：只作用于**转发给客户端**的字节，
+                                # 空占位字段归一 + 「提交前缓冲」：只在确认这是
+                                # **真正文**（而非 200 包着的错误信封）后才把字节发给
+                                # 客户端 —— 一旦发出就无法换号重试了。
                                 # collected 里仍保留上游原文（换号判断/日志/聚合要用原文）。
                                 # 用 aiter_text() 而非 aiter_bytes()：httpx 的文本迭代器
                                 # 是**增量**解码的，不会把一个汉字（3 字节）拆坏；逐 chunk
                                 # 自己 decode("utf-8","replace") 会把拆开的汉字变成 U+FFFD。
-                                # 归一器内部自带增量解码器，喂回编码后的字节即可。
-                                # 提交前必须把已归一化的输出**累积**起来，否则那些
-                                # 早于「正文帧」到达的 reasoning 增量会被丢掉。
-                                normalizer = (StreamDeltaNormalizer()
-                                              if not aggregate and _STREAM_NORMALIZER_AVAILABLE
-                                              else None)
-                                pending: list[str] = []
+                                #
+                                # ⚠️ StreamCommitBuffer **全程只用 bytes**。这里是曾经出过
+                                # 事故的地方：把 normalizer 返回的 bytes 塞进 list[str] 再
+                                # "".join()，每个流式请求在出现第一段正文时抛 TypeError；
+                                # 它又被下面的 except Exception 吞掉（此时 delivered 已为
+                                # True，只静默结束），表现为 nginx「upstream prematurely
+                                # closed connection」+ 客户端「Stream ended without
+                                # finish_reason」，且日志里连堆栈都没有。别再把 str 混进来。
+                                buf = StreamCommitBuffer(
+                                    StreamDeltaNormalizer()
+                                    if not aggregate and _STREAM_NORMALIZER_AVAILABLE
+                                    else None
+                                )
                                 async for chunk in r.aiter_text():
                                     if ttfb_at is None:
                                         ttfb_at = time.perf_counter()
                                     collected.append(chunk)
-                                    clean = (normalizer.feed(chunk.encode("utf-8"))
-                                             if normalizer else chunk)
-                                    if committed:
+                                    clean = buf.feed_text(chunk)
+                                    if buf.committed:
                                         if not aggregate and clean:
                                             yield clean
                                         continue
-                                    if not aggregate:
-                                        pending.append(clean)
                                     probe += chunk
                                     # 看到真实正文增量就提交（此后不再换号）；
                                     # 或缓冲到上限仍未见到正文，也不再憋着。
@@ -2082,21 +2088,18 @@ async def chat_completions(
                                         committed = True
                                         delivered = True
                                         if not aggregate:
-                                            head = "".join(pending)
+                                            head = buf.commit()
                                             if head:
                                                 yield head
-                                        pending = []
-                                        probe = ""
-                                # 流结束时把归一器里的残留吐出来：已提交则直接转发，
-                                # 未提交则并入 pending 交给下面的兜底分支。
-                                if normalizer is not None:
-                                    tail = normalizer.flush()
-                                    if tail:
-                                        tail_text = tail.decode("utf-8", "replace")
-                                        if committed:
-                                            yield tail_text
                                         else:
-                                            pending.append(tail_text)
+                                            buf.commit()
+                                        probe = ""
+                                # 流结束：吐净归一器残留（已提交则立即转发，
+                                # 否则留在 pending 交给下面的兜底分支）。
+                                if not aggregate:
+                                    tail = buf.flush()
+                                    if tail:
+                                        yield tail
                             # 流式完成：先判定这是不是「200 包着的错误」
                             text = "".join(collected)
                             stream_is_error = bool(text) and (
@@ -2158,17 +2161,15 @@ async def chat_completions(
                                 return
                             # 流式模式下若始终没识别到正文（如仅角色帧就结束），
                             # 把缓冲补发给客户端，绝不静默吞掉内容。
-                            # 用已归一化的 pending 而非原始 probe：否则会把上游的
-                            # 空占位字段带出去（本次要修的就是它）。
-                            if not committed and not aggregate and (pending or probe):
-                                ttfb_at = ttfb_at or time.perf_counter()
-                                delivered = True
-                                if pending:
-                                    yield "".join(pending)
-                                    pending = []
-                                else:
-                                    yield probe
-                                probe = ""
+                            # 优先发**已归一化**的 pending（bytes），避免把上游的
+                            # 空占位字段带出去；pending 为空时才退回原始 probe。
+                            if not committed and not aggregate:
+                                tail = buf.take_pending()
+                                if tail or probe:
+                                    ttfb_at = ttfb_at or time.perf_counter()
+                                    delivered = True
+                                    yield tail if tail else probe
+                                    probe = ""
                             # 确认是健康响应后，才清空连败计数：
                             # 「200 但体内是错误」不该被记成一次成功。
                             acc_i.last_used_at = datetime.utcnow()
