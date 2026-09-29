@@ -35,6 +35,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import re
 
@@ -803,7 +804,147 @@ def drop_truncated_tool_calls(msg: dict) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 9. 统一入口
+# 9. 流式 delta 的「空占位字段」归一
+# ---------------------------------------------------------------------------
+# 问题：上游每个 chunk 都带一整组**语义为空**的占位键，例如
+#     {"content":"","reasoning_content":"We","function_call":null,
+#      "refusal":"","tool_calls":[],"extra_fields":null}
+# 其中 tool_calls 是**空数组**而非 null。这本身合法，但会踩中一类客户端的
+# 解析实现：它们判断「本片是不是工具调用」用的是
+#     if (delta.tool_calls != null) { ...关掉思考块、开工具块... }
+# 而不是 `tool_calls.length > 0`。于是每一片思考都被误判成「工具调用开始了」，
+# 客户端把当前 thinking 块关掉、再开一个新的 —— 界面上就变成几十上百条
+# 「思考·持续了几秒」，而模型其实只思考了一次。
+#
+# 上游是流式增量，无法在源头改；客户端实现也不受我们控制。**兼容性最好、
+# 且不丢语义**的做法是在网关侧把这个中间层归一化掉：语义为空的占位键直接
+# 不转发。真正有内容的 tool_calls / function_call / refusal 一律原样保留，
+# 所以不会影响任何依赖它们的客户端。
+#
+# 判定标准（只删「确实没有信息」的）：
+#   tool_calls: []            → 删（空列表 = 没有工具调用）
+#   function_call: null       → 删（旧字段，同义）
+#   refusal: "" / null        → 删（OpenAI 里 refusal 只在拒答时有值）
+#   extra_fields: null        → 删（上游私有扩展位）
+# 注意 `tool_calls: null` **保留**：那是「本片没有该字段」的显式写法，
+# 删掉与保留语义一致，但保留更贴近上游原样，便于排障。
+
+def strip_empty_delta_placeholders(delta: dict) -> int:
+    """删除 delta 里语义为空的占位字段，就地改写。返回删除的键数。
+
+    只处理上面列出的键，其余字段一律不动。
+    """
+    if not isinstance(delta, dict):
+        return 0
+    removed = 0
+    if isinstance(delta.get("tool_calls"), list) and not delta["tool_calls"]:
+        delta.pop("tool_calls", None)
+        removed += 1
+    if "function_call" in delta and delta["function_call"] is None:
+        delta.pop("function_call", None)
+        removed += 1
+    if "refusal" in delta and delta["refusal"] in (None, ""):
+        delta.pop("refusal", None)
+        removed += 1
+    if "extra_fields" in delta and delta["extra_fields"] is None:
+        delta.pop("extra_fields", None)
+        removed += 1
+    return removed
+
+
+def normalize_stream_chunk(obj: dict) -> int:
+    """归一化一个上游 SSE chunk 的 choices[].delta。返回删除的键总数。
+
+    仅动 delta，不动 usage / id / model 等其它字段。
+    """
+    total = 0
+    for choice in (obj.get("choices") or []):
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if isinstance(delta, dict):
+            total += strip_empty_delta_placeholders(delta)
+    return total
+
+
+class StreamDeltaNormalizer:
+    """按行缓冲地把上游 SSE 归一化后转发。
+
+    为什么必须缓冲：一个 ``data:`` 行可能被拆在两个网络 chunk 里，所以不能
+    假设 chunk 边界正好落在行尾 —— 直接对 chunk 做 JSON 解析会漏改甚至误判。
+
+    为什么必须用**增量**解码器：UTF-8 的一个汉字占 3 字节，同样可能被拆到两个
+    chunk 里。逐 chunk ``decode(errors="replace")`` 会把拆开的汉字变成 U+FFFD，
+    直接污染正文与思考内容（本项目的模型大量输出中文，这是必踩的坑）。
+    ``codecs.getincrementaldecoder`` 会把不完整的多字节序列留到下一个 chunk。
+
+    行为约定：
+      * ``data:`` 行 → 解析 JSON、归一化 delta、重新序列化
+      * 空行 / 注释 / ``event:`` 等非 data 行 → **原样**转发（保住 SSE 分帧）
+      * ``[DONE]`` 与无法解析的行 → 原样转发（绝不吞）
+      * 末尾残留由 :meth:`flush` 吐出
+
+    ``removed`` 累计改动过的行数，供日志观测。
+    """
+
+    __slots__ = ("_buf", "_dec", "removed")
+
+    def __init__(self, encoding: str = "utf-8") -> None:
+        self._buf = ""
+        self._dec = codecs.getincrementaldecoder(encoding)(errors="replace")
+        self.removed = 0
+
+    def feed(self, chunk: bytes) -> bytes:
+        """喂入一段**原始字节**，返回可立刻转发的字节（可能为空）。"""
+        if not chunk:
+            return b""
+        self._buf += self._dec.decode(chunk)
+        out: list[str] = []
+        while True:
+            nl = self._buf.find("\n")
+            if nl < 0:
+                break
+            line = self._buf[:nl]
+            self._buf = self._buf[nl + 1:]
+            out.append(self._rewrite_line(line))
+            out.append("\n")
+        return "".join(out).encode("utf-8")
+
+    def flush(self) -> bytes:
+        """流结束时吐出残留（含解码器里未完成的多字节序列）。"""
+        self._buf += self._dec.decode(b"", True)
+        rest, self._buf = self._buf, ""
+        return rest.encode("utf-8")
+
+    def _rewrite_line(self, line: str) -> str:
+        # 保留 CRLF：分离出行尾的 \r，处理完再拼回去
+        cr = "\r" if line.endswith("\r") else ""
+        body = line[:-1] if cr else line
+
+        stripped = body.strip()
+        if not stripped.startswith("data:"):
+            return line
+        payload = stripped[5:].strip()
+        if payload in ("", "[DONE]"):
+            return line
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            return line
+        if not isinstance(obj, dict):
+            return line
+
+        if not normalize_stream_chunk(obj):
+            return line
+
+        self.removed += 1
+        # 保留原有的前导空白（有的上游会写 "data:  {")
+        lead = body[:len(body) - len(body.lstrip())]
+        return f"{lead}data: {json.dumps(obj, ensure_ascii=False)}{cr}"
+
+
+# ---------------------------------------------------------------------------
+# 10. 统一入口
 # ---------------------------------------------------------------------------
 
 def prepare_upstream_body(obj: dict, *, sanitize: bool = False,

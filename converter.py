@@ -1106,6 +1106,10 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
     buf = b""
     raw_parts: list[bytes] = []   # 累积完整原始 SSE
     prefix = f"[{rid}] " if rid else ""
+    # 上游每个 delta 都带空占位键（tool_calls:[]、function_call:null、refusal:""、
+    # extra_fields:null）。这类空值会被一部分客户端误判成「工具调用开始」，
+    # 导致思考被切成许多块。这里在转发前归一化掉（详见 upstream_compat 第 9 节）。
+    normalizer = upstream_compat.StreamDeltaNormalizer()
 
     def _feed(chunk: bytes):
         nonlocal finish_reason, saw_filter, buf
@@ -1156,7 +1160,12 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
                     if chunk:
                         raw_parts.append(chunk)
                         _feed(chunk)
-                        yield chunk
+                        clean = normalizer.feed(chunk)
+                        if clean:
+                            yield clean
+                tail = normalizer.flush()
+                if tail:
+                    yield tail
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
         yield _err_event(str(e).encode(), 502)
