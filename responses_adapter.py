@@ -17,6 +17,51 @@ import time
 from typing import Any
 
 # ---------------------------------------------------------------------------
+# 客户端事件契约：只发「Responses 规范定义、且客户端真正接受」的事件
+# ---------------------------------------------------------------------------
+# OpenAI Responses 规范里，若干事件的字段是**必填**的（见下）。主流客户端用严格
+# schema 校验每个 SSE 事件，校验不通过时**逐条丢弃**该事件（而不是中断整条流），
+# 所以故障表现为静默丢数据，而不是报错。
+#
+# 两个真实踩坑点，症状都是「思考完就断、没有正文」：
+#   1) response.output_text.delta 少了必填的 item_id → 每一条正文 delta 都被
+#      丢掉；reasoning 事件字段齐全所以思考能正常显示，最终只剩空回复。
+#   2) response.in_progress / response.content_part.* / response.output_text.done /
+#      response.reasoning_summary_text.done / response.function_call_arguments.done
+#      属于可选扩展、并非所有客户端都实现 → 发了会被判为非法，白白污染事件流。
+#
+# 所以这里按「官方 Responses 规范的必需事件子集」发最小事件集：字段齐全（合规），
+# 且不依赖可选扩展事件（兼容性最好）。
+ALLOWED_RESPONSES_EVENTS = frozenset({
+    "response.created",
+    "response.output_item.added",
+    "response.output_item.done",
+    "response.output_text.delta",
+    "response.reasoning_summary_part.added",
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_summary_part.done",
+    "response.function_call_arguments.delta",
+    "response.completed",
+    "response.incomplete",
+    "response.failed",
+})
+
+# 部分客户端（老版本 Codex 等）会额外期待 content_part / *.done 这类收尾事件。
+# 置 True 会恢复发送这些可选扩展事件；代价是严格校验的客户端会收到非法事件。
+# 默认 False：只发 ALLOWED_RESPONSES_EVENTS 里的必需事件。
+EMIT_EXTENDED_EVENTS = False
+
+# 仅在 EMIT_EXTENDED_EVENTS=True 时才额外发送的可选扩展事件
+EXTENDED_ONLY_EVENTS = frozenset({
+    "response.in_progress",
+    "response.content_part.added",
+    "response.content_part.done",
+    "response.output_text.done",
+    "response.reasoning_summary_text.done",
+    "response.function_call_arguments.done",
+})
+
+# ---------------------------------------------------------------------------
 # ID 生成
 # ---------------------------------------------------------------------------
 
@@ -273,7 +318,6 @@ class ResponsesStreamConverter:
         # 状态标记
         self._emitted_created = False
         self._emitted_msg_item = False
-        self._emitted_content_part = False
 
         # 累积内容
         self._content = ""
@@ -305,11 +349,23 @@ class ResponsesStreamConverter:
         return self._process_chunk(chunk)
 
     def finish(self) -> str:
-        """流结束后，发出收尾事件（done + completed）。"""
+        """流结束后，发出收尾事件（item done + completed）。
+
+        只发 Responses 规范里的必需事件：`*_text.done` / `content_part.*` /
+        `function_call_arguments.done` 属于可选扩展，严格校验的客户端会判非法
+        （见 ALLOWED_RESPONSES_EVENTS 的注释）。客户端靠
+        `response.output_item.done` 收尾 text/tool 块、靠 `response.completed`
+        拿 finishReason，所以这三类就够。
+        """
         events: list[str] = []
 
         # 关闭 reasoning item（先于正文，与 output 顺序一致）
         if self._emitted_reasoning_item:
+            events.append(self._evt("response.reasoning_summary_part.done", {
+                "item_id": self._reasoning_item_id,
+                "summary_index": 0,
+            }))
+            # 可选扩展事件：仅老客户端需要（_evt 按开关过滤）
             events.append(self._evt("response.reasoning_summary_text.done", {
                 "item_id": self._reasoning_item_id,
                 "output_index": 0,
@@ -321,8 +377,7 @@ class ResponsesStreamConverter:
                 "item": self._reasoning_item("completed"),
             }))
 
-        # 关闭 text content
-        if self._emitted_content_part:
+        if self._emitted_msg_item:
             base = self._body_base_idx()
             events.append(self._evt("response.output_text.done", {
                 "output_index": base, "content_index": 0, "text": self._content
@@ -331,10 +386,8 @@ class ResponsesStreamConverter:
                 "output_index": base, "content_index": 0,
                 "part": {"type": "output_text", "text": self._content, "annotations": []}
             }))
-
-        if self._emitted_msg_item:
             events.append(self._evt("response.output_item.done", {
-                "output_index": self._body_base_idx(),
+                "output_index": base,
                 "item": self._msg_item("completed")
             }))
 
@@ -342,15 +395,17 @@ class ResponsesStreamConverter:
         for idx in sorted(self._tool_calls):
             tc = self._tool_calls[idx]
             if tc.get("emitted"):
-                oi = tc["output_idx"]
                 events.append(self._evt("response.function_call_arguments.done", {
-                    "output_index": oi, "arguments": tc["args"]
+                    "item_id": tc["fc_id"],
+                    "output_index": tc["output_idx"], "arguments": tc["args"]
                 }))
                 events.append(self._evt("response.output_item.done", {
-                    "output_index": oi, "item": self._fc_item(tc, "completed")
+                    "output_index": tc["output_idx"], "item": self._fc_item(tc, "completed")
                 }))
 
-        # response.completed
+        # response.completed —— 必须带 usage（客户端 schema 里 usage 是必填，
+        # 且 input/output_tokens 必须是 number）。上游偶尔不给 usage 时补零，
+        # 否则 completed 校验失败 → 客户端拿不到 finishReason。
         events.append(self._evt("response.completed", {
             "response": self._response_obj("completed")
         }))
@@ -385,7 +440,7 @@ class ResponsesStreamConverter:
         if chunk.get("model"):
             self.model = chunk["model"]
 
-        # 首次 → 发 created + in_progress
+        # 首次 → 发 created（in_progress 不在客户端契约内，_evt 会按需过滤）
         if not self._emitted_created:
             resp = self._response_obj("in_progress")
             events.append(self._evt("response.created", {"response": resp}))
@@ -411,6 +466,12 @@ class ResponsesStreamConverter:
                         "output_index": 0,
                         "item": self._reasoning_item("in_progress"),
                     }))
+                    # summary part 的开场事件：客户端靠它初始化 summary 块，
+                    # 缺了会导致 reasoning 无法按 part 收尾。
+                    events.append(self._evt("response.reasoning_summary_part.added", {
+                        "item_id": self._reasoning_item_id,
+                        "summary_index": 0,
+                    }))
                     self._emitted_reasoning_item = True
                 self._reasoning += reasoning
                 events.append(self._evt("response.reasoning_summary_text.delta", {
@@ -428,17 +489,20 @@ class ResponsesStreamConverter:
                         "output_index": self._body_base_idx(),
                         "item": self._msg_item("in_progress", empty=True)
                     }))
-                    self._emitted_msg_item = True
-
-                if not self._emitted_content_part:
                     events.append(self._evt("response.content_part.added", {
                         "output_index": self._body_base_idx(), "content_index": 0,
                         "part": {"type": "output_text", "text": "", "annotations": []}
                     }))
-                    self._emitted_content_part = True
+                    self._emitted_msg_item = True
 
                 self._content += content
+                # item_id 是**必填**：规范要求 output_text.delta 为
+                # {type,item_id,delta}，且 item_id 必须等于前面
+                # output_item.added 里 announce 的 message id。缺了它，
+                # 严格校验的客户端会把整条正文 delta 丢掉（症状：只剩思考、没有正文）。
+                # output_index/content_index 是规范里的冗余字段，保留以兼容其它客户端。
                 events.append(self._evt("response.output_text.delta", {
+                    "item_id": self.msg_id,
                     "output_index": self._body_base_idx(), "content_index": 0,
                     "delta": content
                 }))
@@ -479,7 +543,10 @@ class ResponsesStreamConverter:
 
                 if fn.get("arguments"):
                     slot["args"] += fn["arguments"]
+                    # item_id 同为必填（规则同 output_text.delta），需指向
+                    # announce 过的 function_call item id（不是 call_id）
                     events.append(self._evt("response.function_call_arguments.delta", {
+                        "item_id": slot["fc_id"],
                         "output_index": slot["output_idx"],
                         "delta": fn["arguments"]
                     }))
@@ -490,7 +557,13 @@ class ResponsesStreamConverter:
         return "".join(events)
 
     def _evt(self, event_type: str, data: dict) -> str:
-        """格式化一个 SSE 事件。"""
+        """格式化一个 SSE 事件；不在客户端契约内的事件直接丢弃。
+
+        EMIT_EXTENDED_EVENTS=True 时放行 EXTENDED_ONLY_EVENTS（为兼容老客户端）。
+        """
+        if event_type not in ALLOWED_RESPONSES_EVENTS:
+            if not (EMIT_EXTENDED_EVENTS and event_type in EXTENDED_ONLY_EVENTS):
+                return ""
         payload = {"type": event_type, **data}
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -527,7 +600,15 @@ class ResponsesStreamConverter:
             if tc.get("emitted"):
                 output.append(self._fc_item(tc, status))
 
-        usage = None
+        # response.completed 的对象里 usage 是必填，且 input_tokens /
+        # output_tokens 必须是 number。上游偶尔不吐 usage，给 None 会导致
+        # completed 不合法 → 客户端拿不到 finishReason。缺失时一律补零。
+        usage = {
+            "input_tokens": 0,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 0,
+            "output_tokens_details": {"reasoning_tokens": 0},
+        }
         if self._usage:
             u = self._usage
             # reasoning_tokens 从上游 usage 真实透出（此前硬编码 0，把思维链用量抹掉了）
@@ -537,11 +618,13 @@ class ResponsesStreamConverter:
                 reasoning_tokens = u.get("completion_thinking_tokens", 0)
             prompt_details = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
             usage = {
-                "input_tokens": u.get("prompt_tokens", u.get("input_tokens", 0)),
-                "input_tokens_details": {"cached_tokens": prompt_details or u.get("cached_tokens", 0)},
-                "output_tokens": u.get("completion_tokens", u.get("output_tokens", 0)),
+                "input_tokens": u.get("prompt_tokens", u.get("input_tokens", 0)) or 0,
+                "input_tokens_details": {
+                    "cached_tokens": prompt_details or u.get("cached_tokens", 0) or 0
+                },
+                "output_tokens": u.get("completion_tokens", u.get("output_tokens", 0)) or 0,
                 "output_tokens_details": {"reasoning_tokens": reasoning_tokens or 0},
-                "total_tokens": u.get("total_tokens", 0),
+                "total_tokens": u.get("total_tokens", 0) or 0,
             }
 
         return {
