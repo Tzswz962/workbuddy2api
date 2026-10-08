@@ -91,7 +91,7 @@ _SYNC_SOFT_BUDGET = 50.0
 #: 定时任务整批的预算（秒）。
 #:
 #: 为什么必须有：定时任务是**在调度线程里同步跑**的，跑多久就占多久。
-#: 23 个账号 × 单账号最长 300s，最坏能把调度线程占住 1 个多小时 ——
+#: xx 个账号 × 单账号最长 300s，最坏能把调度线程占住 1 个多小时 ——
 #: 期间整点刷新余额、签到、token 保活**全都不会执行**。
 #: 这就是「定时任务会不会卡住」的答案：会，而且卡的是整个调度器。
 #:
@@ -439,7 +439,7 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
 
                 # 快速通道：没有可做的任务、也没有待领取的奖励时，
                 # 直接返回。拉一次列表已经是全部开销，不再多打任何请求。
-                # （号池做完后就是这种状态，10 个账号应秒过而不是等几十秒）
+                # （号池做完后就是这种状态，应秒过而不是等几十秒）
                 claimable = [t.get("task_code") for t in tasks
                              if t.get("accept_status") == "completed"]
                 if not wanted and not claimable:
@@ -545,7 +545,7 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                     fire_model = plan.model or model
                     # Ardot 类任务的前置条件：账号必须已绑定 Ardot，否则取票会
                     # 得到 10101 access token not found，任务**必然**失败。
-                    # 实测 15 个账号里 10 个初始未绑定，所以这里主动补绑定，
+                    # 实测多数账号初始未绑定，所以这里主动补绑定，
                     # 而不是让用户看到一条「未换取 Ardot access token」的报错。
                     if plan.firer == "fire_design_canvas":
                         try:
@@ -851,7 +851,7 @@ def _resolve_ids(payload_ids: list[int] | None) -> list[int]:
 def growth_run_async(payload: RunIn):
     """异步批量做任务：立即返回 job_id，前端轮询进度。
 
-    为什么异步：一个账号约 27 秒（串行 + 限速），13 个账号要 6 分钟以上，
+    为什么异步：一个账号约 27 秒（串行 + 限速），xx 个账号要 6 分钟以上，
     同步等会让 nginx 先超时（默认 60s）→ 前端吃 504、体感「点了没反应」。
 
     重复点击不会叠起并发批量：同 key 已有任务在跑时直接返回现有 job。

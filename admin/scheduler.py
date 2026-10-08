@@ -214,8 +214,8 @@ def run_keepalive_tokens(db) -> dict:
       * **只刷新不调用**：不发起对话、不消耗积分、不产生对话记录。
       * **必须真探测（本次修复的关键）**：原来只调 `get_headers()`，
         它只在**本地** expiresAt 临近时才刷新 token —— 而登录态被上游**吊销**时，
-        本地 expiresAt 可能还有几千小时（实测 6231h），于是保活一路报「存活 ✓」，
-        真实请求却 401。这就是「7 个号失效了但保活说全好」的根因。
+        本地 expiresAt 可能还有几千小时，于是保活一路报「存活 ✓」，
+        真实请求却 401。这就是「xx 个号失效了但保活说全好」的根因。
         现在改为调一次最轻的鉴权接口（取模型列表）：它不发对话、零积分消耗，
         但能真实回答「这个登录态上游还认不认」。
       * **区分 401 与网络抖动**：401/403 是登录态废了（终态）；
@@ -283,7 +283,7 @@ def run_keepalive_tokens(db) -> dict:
             from admin.routers.proxy import _classify_error, _extract_http_status
             # 从异常文本里抠出真实状态码再分类。
             # 传 0 会把 401 归成 transport（网络抖动），于是失效号永远不被发现
-            # ——这正是「7 个号失效、保活却报全好」的最后一环。
+            # ——这正是「xx 个号失效、保活却报全好」的最后一环。
             http_status = _extract_http_status(msg)
             kind = _classify_error(http_status, msg)
             # 只有「上游明确说登录态无效」才计入失效：401/403（session_dead）、
@@ -301,7 +301,7 @@ def run_keepalive_tokens(db) -> dict:
                 #   * 刷新接口返回的 `invalid_grant` /
                 #     `Offline user session not found` —— 这是 OAuth 标准里
                 #     「该会话已在服务端被删除」的语义，属于**终态**，
-                #     与「文案式 12153 抖动」完全不同（实测那 7 个号正是这个）。
+                #     与「文案式 12153 抖动」完全不同（实测那 xx 个号正是这个）。
                 authoritative = (http_status in (401, 403)
                                  or any(m in msg.lower() for m in _AUTH_DEAD_MARKERS))
                 threshold = 1 if authoritative else _KEEPALIVE_DEAD_THRESHOLD
@@ -393,7 +393,7 @@ def run_growth_tasks() -> dict:
         run_res = growth_router.run_accounts(
             ids, None, db,
             # 整批预算：定时任务在**调度线程**里同步跑，跑多久占多久。
-            # 没有这个上限时，23 个账号最坏能占住调度线程一个多小时，
+            # 没有这个上限时，xx 个账号最坏能占住调度线程一个多小时，
             # 期间整点刷新余额 / 签到 / token 保活全部停摆
             # （表现为「定时任务卡住了」）。超出预算的账号如实记录、留待下次。
             soft_budget=growth_router._SCHEDULE_SOFT_BUDGET)
@@ -635,7 +635,7 @@ def _run_one(s: Schedule, db, now: datetime):
     # 下次轮询就把 next_run_at 顺延到**第二天**，而 last_run_at 不动。
     # 结果是「每天 22 点刚好错过 → 永远错过」：实测 09-20 之后连续 18 天
     # 一次都没跑过，而界面上每天都显示「下次 22:00」，看起来完全正常。
-    # 这直接导致 7 个账号登录态失效后无人发现。
+    # 这直接导致 xx 个账号登录态失效后无人发现。
     #
     # 现在的语义是**到期窗口**：只要现在距上次成功执行已超过一个周期
     # （或超过了今天的计划时刻），就补跑一次。这样错过整点只会「晚跑」，

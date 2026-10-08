@@ -1978,7 +1978,7 @@ async function loadAccounts() {
           sub: soonest ? `最近 ${soonest.replace(/<[^>]+>/g, "")}` : "全部长期有效" })}`;
   const headCount = $("#accHeadCount");
   if (headCount) headCount.textContent = s.total;
-  // 括号里补上「启用 / 禁用」，避免「共 22 个」被误读成「22 个都能用」
+  // 括号里补上「启用 / 禁用」，避免「共 xx 个」被误读成「xx 个都能用」
   const headBreak = $("#accHeadBreak");
   if (headBreak) {
     headBreak.textContent = `（启用 ${s.active}`
@@ -2535,7 +2535,7 @@ async function growthRunBatch(){
       okText:"开始执行"})) return;
 
   // 交给后台线程串行跑，前端只轮询进度：
-  // 原先前端逐个账号发两轮请求（run + claim），13 个账号要 6 分钟以上，
+  // 原先前端逐个账号发两轮请求（run + claim），xx 个账号要 6 分钟以上，
   // nginx 默认 60s 就超时，体感是「点了没反应」。现在点完立刻有进度条。
   await runJob({
     title: "批量做成长任务",
@@ -2920,7 +2920,7 @@ function renderCreditOverview(d) {
   const atRisk = Number(s.at_risk_ratio || 0) * 100;
   // 概览卡用**余额口径**的可用积分（与账号面板「可用积分」一致）。
   // 快照口径只覆盖采集过到期数据的号，拿它当「总剩余」会偏小，
-  // 于是同一块屏上两个面板显示两个不同的总数（实测差 3015）。
+  // 于是同一块屏上两个面板显示两个不同的总数。
   const avail = Number(s.available_remaining != null ? s.available_remaining : s.total_remaining);
   const snapAcc = Number(s.snapshot_accounts || s.accounts || 0);
   box.innerHTML = `

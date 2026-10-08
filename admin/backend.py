@@ -1556,10 +1556,10 @@ class AccountSession:
         ardot/accesstoken` 返回 `{"code":0,...,"data":{"access_token":"<JWT>",
         "expire_at":...}}` —— 说明**不需要**交互式授权。
 
-        **但绑定是按账号存在的**：15 个真实账号里只有 5 个天然已绑定，其余 10 个
+        **但绑定是按账号存在的**：只有少数账号天然已绑定，其余多数
         返回 `422 {"code":10101,"msg":"access token not found"}`，必须先调
         `connect_ardot()` 建立绑定（见该方法的文档）。若在这里直接失败即返回空串，
-        那 10 个账号的 create_canvas 会永远做不了。
+        那些未绑定账号的 create_canvas 会永远做不了。
 
         返回空串表示换取失败（调用方应放弃去拿真实画布 id，绝不伪造）。
         """
