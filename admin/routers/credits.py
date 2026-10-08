@@ -175,6 +175,20 @@ def credit_expiry_stats(
         (r for r in rows if r["soonest_expire_at"]),
         key=lambda r: r["soonest_expire_at"], default=None)
 
+    # 「可用积分」用**余额口径**，不用快照口径。
+    #
+    # `total_remaining` 来自逐包到期快照，只覆盖「采集过到期数据」的账号
+    # （实测 16 个活跃号里只有 14 个有快照），所以它天然偏小；
+    # 而账号面板的 `balance_remain` 取 `Account.balance_remain`（每个号都有）。
+    # 两者混用会让同一块屏上出现两个不同的「总剩余积分」——
+    # 实测差 3015，正是那 2 个尚未采集快照的号的余额。
+    #
+    # 所以：**概览卡片用余额口径**（与账号面板一致），
+    # 到期分档条继续用快照口径（它本来就只描述有到期数据的那部分），
+    # 并把快照覆盖数一并给出，便于界面如实标注。
+    available_remaining = sum(float(a.balance_remain or 0) for a in accounts)
+    snapshot_accounts = sum(1 for a in accounts if a.credits_synced_at)
+
     # 逐包平铺与分档：**直接读各自账号的快照**（而不是 accounts[] 里那 4 条），
     # 这样聚合口径完整，且不必把全量明细发给前端。
     cuts = [1, 3, 7, 14, 30]
@@ -212,7 +226,11 @@ def credit_expiry_stats(
         "suggested_days": days,
         "summary": {
             "accounts": len(rows),
+            # 概览卡片用这个（余额口径，与账号面板一致）
+            "available_remaining": round(available_remaining, 4),
+            # 快照口径：只覆盖「采集过到期数据」的账号，供到期分档条使用
             "total_remaining": round(total_remaining, 4),
+            "snapshot_accounts": snapshot_accounts,
             "expiring_soon_remaining": round(expiring_soon, 4),
             "evergreen_remaining": round(evergreen, 4),
             "expired_remaining": round(expired, 4),

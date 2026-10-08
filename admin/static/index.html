@@ -603,6 +603,56 @@
   color:var(--fg-subtle); overflow:hidden; text-overflow:ellipsis;
   white-space:nowrap; max-width:92px;
 }
+
+/* ==========================================================================
+   手机端：账号表 → **卡片列表**（彻底去掉横向滚动）
+   --------------------------------------------------------------------------
+   原来的移动端表现很糟：表格 min-width 960px + 首列 `position:sticky` 吸附，
+   而首列自己就有 230px 宽 —— 在 390px 的机身上它一个人就占了近 60%，
+   右边几列全被挤出去，必须左右拖，用户只能靠缩放浏览器比例才看得全。
+
+   这类「宽表格」在窄屏没有好结果：列再多也塞不下。所以窄屏直接换形态 ——
+   每个账号变成一张卡片，字段名用 `td::before { content: attr(data-label) }`
+   补在左侧，全部竖排，**不再产生任何横向滚动**。
+   （用 CSS 复用同一份 DOM，不额外写一套渲染逻辑，避免两处漂移。）
+   ========================================================================== */
+@media (max-width:640px){
+  .acc-table{ min-width:0 !important; }
+  .acc-table thead{ display:none; }
+  .acc-table, .acc-table tbody, .acc-table tr, .acc-table td{ display:block; width:auto; }
+  .acc-table tbody tr{
+    border:1px solid var(--border); border-radius:12px;
+    background:var(--surface); padding:10px 12px; margin-bottom:10px;
+  }
+  .acc-table tbody tr:hover td{ background:transparent; }
+  .acc-table tbody td{
+    border:0; padding:4px 0; white-space:normal;
+    display:flex; align-items:center; justify-content:space-between; gap:12px;
+    text-align:right;
+  }
+  /* 字段名：小字灰色，固定不缩，保证对齐好看 */
+  .acc-table tbody td::before{
+    content:attr(data-label);
+    flex:0 0 auto; font-size:11.5px; color:var(--fg-subtle); text-align:left;
+  }
+  /* 首列当卡片标题：占满整行、不显示字段名、允许折行 */
+  .acc-table tbody td.c-name{
+    max-width:none; padding-bottom:8px; margin-bottom:4px;
+    border-bottom:1px solid var(--border-soft);
+    display:block; text-align:left;
+  }
+  .acc-table tbody td.c-name::before{ content:none; }
+  .acc-table .c-name .nm > b{ max-width:none; white-space:normal; }
+  .acc-table .c-name .nm{ flex-wrap:wrap; }
+  /* uid 在窄屏允许换行显示全，别再截断 */
+  .acc-table .c-uid{ max-width:none; white-space:normal; word-break:break-all; }
+  /* 到期那一格里的小字说明允许换行 */
+  .acc-exp{ flex-wrap:wrap; white-space:normal; justify-content:flex-end; }
+  /* 操作按钮右对齐、可换行 */
+  .acc-table tbody td.c-ops{ flex-wrap:wrap; justify-content:flex-end; padding-top:8px; }
+  .acc-table .c-ops button{ padding:6px; font-size:14px; }
+  .acc-table tbody td.c-ops::before{ align-self:center; }
+}
 /* 操作按钮：图标密集但可点区域够大 */
 .acc-table .c-ops{ text-align:right; }
 .acc-table .c-ops button{
@@ -713,8 +763,10 @@
       <div class="page-head">
         <div>
           <h1>账号池</h1>
-          <p>共 <span id="accHeadCount">-</span> 个账号。<b>积分到期</b>一列显示每个号最近要作废的积分包；
-             列表顺序不是调度的使用顺序（要看优先级请到「积分到期」）。</p>
+          <p>共 <span id="accHeadCount">-</span> 个账号<span id="accHeadBreak"></span>。
+             <b>积分到期</b>一列显示每个号最近要作废的积分包；
+             列表顺序不是调度的使用顺序（要看优先级请到「积分到期」）。
+             <b>统计只算启用中的账号</b> —— 已禁用号的余额用不到，不会计入。</p>
         </div>
         <div class="flex flex-wrap gap-2">
           <button onclick="growthRunBatch()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="对全部账号：自动参与并完成可自动化的成长任务，然后领奖"><i class="fa-solid fa-seedling mr-1 text-emerald-600"></i> 批量做任务</button>
@@ -1876,6 +1928,10 @@ function accRow(a) {
     [`toggleAcc(${a.id},'${a.status==='active'?'disabled':'active'}')`, "fa-power-off", "text-slate-500", "启用/禁用"],
     [`delAcc(${a.id})`, "fa-trash", "text-red-500", "删除"],
   ];
+  // data-label 是给**窄屏卡片形态**用的字段名（见 CSS 里的移动端段落）：
+  // 窄屏下表格变成卡片，靠 `td::before { content: attr(data-label) }`
+  // 在每行左边补出「总积分 / 剩余 / 积分到期」这些标签，
+  // 这样同一份 DOM 既能当表格又能当卡片，不必写两套渲染逻辑。
   return `<tr>
     <td class="c-name">
       <div class="nm">
@@ -1883,13 +1939,13 @@ function accRow(a) {
         <span class="c-uid" title="${esc(a.uid || "")}">${esc(a.uid || "-")}</span>
       </div>
     </td>
-    <td class="col-status">${badge(a.status)}</td>
-    <td class="tnum text-right" style="color:var(--fg-muted)">${a.balance_total}</td>
-    <td class="tnum text-right font-medium ${a.balance_remain>0?'text-emerald-600':'text-red-500'}">
+    <td class="col-status" data-label="状态">${badge(a.status)}</td>
+    <td class="tnum text-right" data-label="总积分" style="color:var(--fg-muted)">${a.balance_total}</td>
+    <td class="tnum text-right font-medium" data-label="剩余" style="color:${a.balance_remain>0?'var(--ok,#059669)':'var(--danger)'}">
       ${a.balance_remain}${soon > 0 ? `<span class="fs-10-5" style="color:var(--warn)"> (${fmtCredit(soon)})</span>` : ""}
     </td>
-    <td>${accExpiryCell(a)}</td>
-    <td class="c-ops">${ops.map(([fn, ic, col, ttl]) =>
+    <td data-label="积分到期">${accExpiryCell(a)}</td>
+    <td class="c-ops" data-label="操作">${ops.map(([fn, ic, col, ttl]) =>
       `<button onclick="${fn}" class="${col}" title="${ttl}"><i class="fa-solid ${ic}"></i></button>`).join("")}</td>
   </tr>`;
 }
@@ -1903,9 +1959,16 @@ async function loadAccounts() {
     ? expiryBadge((s.soonest_expire_at - Date.now()) / 86400000, false, true) : "";
   $("#overview").innerHTML = `
     ${statCard("账号总数", s.total, { icon:"fa-users", iconColor:"text-slate-400",
-        sub: `启用 ${s.active} · 可用 ${s.available}` })}
-    ${statCard("总剩余积分", fmtCredit(s.balance_remain), { icon:"fa-wallet", iconColor:"text-slate-400",
-        tone: soon > 0 ? "warn" : "brand", sub: `总额度 ${fmtCredit(s.balance_total)}` })}
+        sub: `启用 ${s.active} · 可用 ${s.available}`
+             + (s.disabled ? ` · 已禁用 ${s.disabled}` : "") })}
+    ${statCard("可用积分", fmtCredit(s.balance_remain), { icon:"fa-wallet", iconColor:"text-slate-400",
+        tone: soon > 0 ? "warn" : "brand",
+        // 口径必须写明：这里**只算启用中的账号**。
+        // 已禁用（登录失效等）的号余额用不到，单独列出来，
+        // 否则用户会看到「号少了但积分没少」。
+        sub: `启用账号合计（总额度 ${fmtCredit(s.balance_total)}）`
+             + (s.disabled_balance_remain
+                 ? ` · 另有 ${fmtCredit(s.disabled_balance_remain)} 在已禁用号上（未计入）` : "") })}
     ${statCard("7 天内到期", fmtCredit(soon), { icon:"fa-fire", iconColor:"text-orange-500",
         tone: soon > 0 ? "warn" : "brand",
         sub: soon > 0 ? `${s.expiring_accounts} 个账号 · 不用完会作废` : "暂无即将作废的额度" })}
@@ -1915,6 +1978,12 @@ async function loadAccounts() {
           sub: soonest ? `最近 ${soonest.replace(/<[^>]+>/g, "")}` : "全部长期有效" })}`;
   const headCount = $("#accHeadCount");
   if (headCount) headCount.textContent = s.total;
+  // 括号里补上「启用 / 禁用」，避免「共 22 个」被误读成「22 个都能用」
+  const headBreak = $("#accHeadBreak");
+  if (headBreak) {
+    headBreak.textContent = `（启用 ${s.active}`
+      + (s.disabled ? ` · 已禁用 ${s.disabled}` : "") + `）`;
+  }
   _accData = d.items || [];
   _accSummary = s;
   renderAccPage(1);
@@ -2849,10 +2918,15 @@ function renderCreditOverview(d) {
   const box = $("#creditOverview");
   if (!box) return;
   const atRisk = Number(s.at_risk_ratio || 0) * 100;
+  // 概览卡用**余额口径**的可用积分（与账号面板「可用积分」一致）。
+  // 快照口径只覆盖采集过到期数据的号，拿它当「总剩余」会偏小，
+  // 于是同一块屏上两个面板显示两个不同的总数（实测差 3015）。
+  const avail = Number(s.available_remaining != null ? s.available_remaining : s.total_remaining);
+  const snapAcc = Number(s.snapshot_accounts || s.accounts || 0);
   box.innerHTML = `
-    ${statCard("总剩余积分", fmtCredit(s.total_remaining), {
+    ${statCard("可用积分", fmtCredit(avail), {
         icon:"fa-wallet", iconColor:"text-slate-400", tone:"brand",
-        sub:`${s.accounts} 个账号 · ${s.expiring_packages} 个快到期包` })}
+        sub:`${s.accounts} 个启用账号 · ${s.expiring_packages} 个快到期包` })}
     ${statCard(`${d.expiring_soon_days} 天内到期`, fmtCredit(s.expiring_soon_remaining), {
         icon:"fa-fire", iconColor:"text-orange-500",
         tone: s.expiring_soon_remaining > 0 ? "warn" : "brand",
@@ -2883,7 +2957,15 @@ function renderCreditRisk(d) {
   const wins = (d.windows || []).filter(w => w.amount > 0);
   const total = Number(d.summary.total_remaining || 0);
   const evergreen = Number(d.summary.evergreen_remaining || 0);
-  if (hint) hint.textContent = total > 0 ? `共 ${fmtCredit(total)} 积分，按到期时间分档` : "";
+  // 如实标注覆盖范围：分档条只统计「已采集到期快照」的账号
+  // （`total_remaining` 是快照口径），没采集的号不在其中。
+  // 不写清楚的话，用户会拿它跟上面的「可用积分」对比，觉得数字对不上。
+  const _snapN = Number(d.summary.snapshot_accounts || 0);
+  const _allN = Number(d.summary.accounts || 0);
+  const _cover = _snapN && _allN && _snapN < _allN
+    ? `（已采集 ${_snapN}/${_allN} 个账号）` : "";
+  if (hint) hint.textContent = total > 0
+    ? `共 ${fmtCredit(total)} 积分，按到期时间分档${_cover}` : "";
   if (!wins.length) {
     box.innerHTML = `<div class="empty">没有任何即将到期的额度 —— 全部积分包都是长期有效或已清空。</div>`;
     return;

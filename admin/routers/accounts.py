@@ -411,22 +411,41 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
         }
         for a in rows
     ]
+    # 汇总口径：**积分类合计一律只算 active 账号**。
+    #
+    # 原来这里把全部账号（含已禁用/登录失效的）一起加进 balance_remain /
+    # credits_expiring_soon，导致两个问题：
+    #   1. 与「积分到期」面板对不上 —— 那个面板只算 active，
+    #      于是同一块屏上一个显示 61915、另一个显示 49837（实测差 12078，
+    #      正是 6 个禁用号里根本用不到的额度）；
+    #   2. 数字只增不减：账号登录失效被禁用后，它的余额仍被算进「可用积分」，
+    #      用户看到的是「号少了但积分没少」。
+    #
+    # 已禁用账号那部分**不隐藏、但单独给**（disabled_*），
+    # 这样既不污染「可用」，又不至于让人以为数据丢了。
+    active_items = [i for i in items if i["status"] == "active"]
+    disabled_items = [i for i in items if i["status"] != "active"]
     summary = {
         "total": len(items),
-        "active": sum(1 for i in items if i["status"] == "active"),
-        "available": sum(1 for i in items if i["status"] == "active" and i["balance_remain"] > 0),
-        "balance_total": sum(i["balance_total"] for i in items),
-        "balance_remain": sum(i["balance_remain"] for i in items),
-        # 到期维度汇总：整池有多少额度处于「7 天内作废」的危险区
-        "credits_expiring_soon": sum(i["credits_expiring_soon"] for i in items),
-        "credits_evergreen": sum(i["credits_evergreen"] for i in items),
-        "credits_expired": sum(i["credits_expired"] for i in items),
+        "active": len(active_items),
+        "disabled": len(disabled_items),
+        "available": sum(1 for i in active_items if i["balance_remain"] > 0),
+        # —— 可用口径（只看 active），与 /api/credits/expiry 保持一致 ——
+        "balance_total": sum(i["balance_total"] for i in active_items),
+        "balance_remain": sum(i["balance_remain"] for i in active_items),
+        "credits_expiring_soon": sum(i["credits_expiring_soon"] for i in active_items),
+        "credits_evergreen": sum(i["credits_evergreen"] for i in active_items),
+        "credits_expired": sum(i["credits_expired"] for i in active_items),
         "expiring_accounts": sum(
-            1 for i in items if i["status"] == "active" and i["credits_expiring_soon"] > 0),
+            1 for i in active_items if i["credits_expiring_soon"] > 0),
         "soonest_expire_at": min(
-            (i["credits_soonest_expire_at"] for i in items
-             if i["status"] == "active" and i["credits_soonest_expire_at"]),
+            (i["credits_soonest_expire_at"] for i in active_items
+             if i["credits_soonest_expire_at"]),
             default=None),
+        # —— 已禁用账号那部分：透明展示，但不计入上面的「可用」——
+        "disabled_balance_remain": sum(i["balance_remain"] for i in disabled_items),
+        "disabled_credits_expiring_soon": sum(
+            i["credits_expiring_soon"] for i in disabled_items),
     }
     return {"items": items, "summary": summary}
 
