@@ -21,24 +21,438 @@
   <link rel="stylesheet" href="/static/vendor/tailwind/tailwind.min.css" />
   <link rel="stylesheet" href="/static/vendor/fontawesome/css/all.min.css" />
   <style>
+    /* ==========================================================================
+       设计令牌（借鉴 workbuddy-switch 的设计系统）
+       --------------------------------------------------------------------------
+       原配色是一套「自己调的绿」(#28b894)，与官方客户端并不一致；这里换成
+       官方品牌的青绿 #42c08e，并把中性色、圆角、阴影、语义色统一成一组
+       令牌 —— 参考项目的观感之所以更「像 workbuddy」，核心就在这套令牌
+       而不是某个单独的样式技巧：字重只有 400/500/600，圆角 12px 一档，
+       阴影是「极淡的 slate 双层」而不是明显的投影。
+
+       与参考项目的差异：那边是 Tailwind v4 的 oklch CSS-first 配置，
+       这里是预编译的 Tailwind v3 静态 CSS，所以令牌写成十六进制、
+       并通过 CSS 变量 + 少量语义类落地（不引入新的构建步骤）。
+       ========================================================================== */
     :root{
-      --wb-primary:#28b894; --wb-primary-d:#23a886;
-      --wb-grad:linear-gradient(135deg,#28b894 0%,#23a886 100%);
-      --wb-bg:#f3f3f6;
-      --wb-surface:#fafafa;
-      --wb-border:#f0f0f0;
+      /* 品牌：官方青绿 */
+      --brand:#42c08e;            /* 浅色模式主色 */
+      --brand-strong:#2ea87a;     /* hover / 强调 */
+      --brand-ink:#1f8a63;        /* 主色文字（保证白底对比度） */
+      --brand-soft:rgba(66,192,142,.12);
+      --brand-grad:linear-gradient(135deg,#42c08e 0%,#2ea87a 100%);
+
+      /* 中性面 */
+      --bg:#f5f6f8;               /* 页面底 */
+      --surface:#ffffff;          /* 卡片 */
+      --surface-2:#f0f2f4;        /* 次级面（muted） */
+      --surface-3:#e6e8eb;        /* 三级面（accent） */
+      --border:#dfe1e5;
+      --border-soft:rgba(223,225,229,.6);
+
+      /* 文字 */
+      --fg:#16181d;
+      --fg-muted:#656970;
+      --fg-subtle:#94a3b8;
+
+      /* 语义色：到期风险是本次的重点，必须与「一般警告」区分开 */
+      --warn:#ea580c;             /* 7 天内到期（橙，与官方一致） */
+      --warn-bar:#f97316;
+      --warn-soft:rgba(249,115,22,.12);
+      --danger:#e7000b;           /* 已到期 */
+      --danger-soft:rgba(231,0,11,.10);
+      --ok:#16a34a;
+      --ok-soft:rgba(22,163,74,.12);
+
+      /* 圆角：基准 12px，派生 8/10/16 */
+      --r-sm:8px; --r:12px; --r-lg:16px;
+
+      /* 阴影：极淡的 slate 双层（参考项目的招牌） */
+      --sh-1:0 1px 2px rgba(15,23,42,.025), 0 10px 28px rgba(15,23,42,.035);
+      --sh-2:0 2px 4px rgba(15,23,42,.04), 0 14px 34px rgba(15,23,42,.055);
+      --sh-pop:0 10px 30px rgba(15,23,42,.12);
+
+      /* 兼容旧变量名（模板里仍有 .bg-wb / .text-wb / var(--wb-primary) 的引用） */
+      --wb-primary:var(--brand);
+      --wb-primary-d:var(--brand-strong);
+      --wb-grad:var(--brand-grad);
+      --wb-bg:var(--bg);
+      --wb-surface:var(--surface-2);
+      --wb-border:var(--border);
+
+      /* 图表色板：借鉴参考项目的 data-series（浅色档位） */
+      --c1:#139e6f; --c2:#33a6a0; --c3:#526fb2; --c4:#9379c2;
+      --c5:#ce9a43; --c6:#cb6c6d; --c7:#4492bd; --c8:#86a152;
     }
-    body{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; background:var(--wb-bg); color:#2b2f33; }
+    /* 深色模式：跟随系统（参考项目也支持，这里只做最小可用的一套） */
+    @media (prefers-color-scheme: dark){
+      :root{
+        --bg:#0f172b; --surface:#1d293d; --surface-2:#29364b; --surface-3:#33425c;
+        --border:rgba(255,255,255,.10); --border-soft:rgba(255,255,255,.06);
+        --fg:#e2e8f0; --fg-muted:#90a1b9; --fg-subtle:#64748b;
+        --brand:#00bc7d; --brand-strong:#00a86e; --brand-ink:#34d399;
+        --brand-soft:rgba(0,188,125,.16);
+        --warn:#fb923c; --warn-bar:#f97316; --warn-soft:rgba(249,115,22,.18);
+        --danger:#ff6467; --ok:#4ade80;
+        --sh-1:0 1px 2px rgba(0,0,0,.24), 0 10px 28px rgba(0,0,0,.28);
+        --sh-2:0 2px 4px rgba(0,0,0,.28), 0 14px 34px rgba(0,0,0,.34);
+        --sh-pop:0 10px 30px rgba(0,0,0,.45);
+        --c1:#48c190; --c2:#59c5bf; --c3:#92b3fb; --c4:#c2a7f4;
+        --c5:#ebb761; --c6:#f79494; --c7:#6dbbe8; --c8:#a7c474;
+      }
+    }
+    body{
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+      background:var(--bg); color:var(--fg);
+      -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;
+      font-synthesis:none;
+    }
+    /* 数字一律等宽对齐：表格里跳动的数字不等宽会显得很廉价 */
+    .tnum{ font-variant-numeric:tabular-nums; }
     .fade-in{ animation:fade .22s ease; }
     @keyframes fade{ from{opacity:0;transform:translateY(6px);} to{opacity:1;transform:none;} }
     .toast{ position:fixed; right:16px; bottom:16px; z-index:60; }
-    .modal-overlay{ background:rgba(15,23,42,.45); backdrop-filter:blur(2px); }
+    .modal-overlay{ background:rgba(15,23,42,.5); backdrop-filter:blur(2px); }
     pre{ white-space:pre-wrap; word-break:break-all; }
-    .bg-wb{ background:var(--wb-grad); }
-    .text-wb{ color:var(--wb-primary); }
-    .btn-primary{ background:var(--wb-grad); color:#fff; transition:.15s; }
+    .bg-wb{ background:var(--brand-grad); }
+    .text-wb{ color:var(--brand-ink); }
+    .btn-primary{ background:var(--brand-grad); color:#fff; transition:.15s; box-shadow:0 1px 2px rgba(15,23,42,.08); }
     .btn-primary:hover{ filter:brightness(1.06); }
-    .card{ background:#fff; border:1px solid var(--wb-border); border-radius:1rem; box-shadow:0 1px 3px rgba(17,24,39,.04),0 1px 2px rgba(17,24,39,.03); }
+    .card{
+      background:var(--surface); border:1px solid var(--border); border-radius:var(--r);
+      box-shadow:var(--sh-1);
+    }
+    /* 卡片内表格：去掉外框，让「卡片本身」承担容器语义（参考项目的做法） */
+    .card-flat{ box-shadow:none; }
+
+    /* ===== 布局外壳：左侧导航栏 + 内容区 =====
+     * 参考项目用 220px 的着色侧栏 + 1180px 居中内容。
+     * 这里同样采用：11 个面板用顶部横排胶囊在窄屏会挤成两行、且滚动位置
+     * 与内容脱节；侧栏把「导航」和「内容滚动」彻底分开，长列表翻到底部
+     * 也能立刻切换面板。 */
+    .app-shell{ display:flex; min-height:100vh; }
+    .app-side{
+      width:216px; flex-shrink:0; background:var(--surface);
+      border-right:1px solid var(--border);
+      display:flex; flex-direction:column; gap:2px; padding:16px 12px;
+      position:sticky; top:0; height:100vh; overflow-y:auto;
+    }
+    /* 品牌区与侧栏底部：桌面显示，移动端隐藏（移动端顶栏只需要图标+汉堡） */
+    .side-brand{
+      display:flex; align-items:center; gap:10px; padding:0 12px 16px; margin-bottom:8px;
+      border-bottom:1px solid var(--border);
+    }
+    .side-foot{
+      margin-top:auto; padding:12px 12px 0; font-size:11px;
+      border-top:1px solid var(--border); color:var(--fg-subtle);
+    }
+    /* 导航容器：**类而不是内联样式**。
+     * 内联 style 的优先级高于媒体查询，用内联写死 flex-direction:column
+     * 会让移动端的「横向排列 / 折叠」规则全部失效（踩过）。 */
+    .side-nav{ display:flex; flex-direction:column; gap:2px; }
+    /* 汉堡按钮：移动端才显示 */
+    .side-toggle{
+      display:none; align-items:center; justify-content:center;
+      width:38px; height:38px; border-radius:10px; flex-shrink:0;
+      border:1px solid var(--border); background:var(--surface);
+      color:var(--fg); cursor:pointer; font-size:15px;
+    }
+    .side-toggle:hover{ background:var(--surface-2); }
+    .side-item{
+      display:flex; align-items:center; gap:10px;
+      padding:9px 12px; border-radius:calc(var(--r) - 2px);
+      font-size:13.5px; color:var(--fg-muted); cursor:pointer;
+      transition:background .15s, color .15s; outline:none; border:0;
+      background:transparent; width:100%; text-align:left;
+    }
+    .side-item:hover{ background:rgba(15,23,42,.04); color:var(--fg); }
+    .side-item.active{ background:rgba(15,23,42,.06); color:var(--fg); font-weight:600; }
+    .side-item i{ width:16px; text-align:center; font-size:13px; }
+    .side-item .side-dot{
+      margin-left:auto; min-width:18px; height:18px; padding:0 5px;
+      display:inline-flex; align-items:center; justify-content:center;
+      border-radius:9999px; background:var(--warn); color:#fff;
+      font-size:10px; font-weight:600; font-variant-numeric:tabular-nums;
+    }
+    .app-main{ flex:1; min-width:0; display:flex; flex-direction:column; }
+    /* 内容宽度与**垂直节奏**。
+     *
+     * 间距问题的根因：原先靠 Tailwind 的 `mb-5` 撑开「指标卡 → 面板」的间隔，
+     * 而 `mb-5` **不在预编译 CSS 里**（构建时没扫到），于是那个 margin 实际是 0，
+     * 指标卡与下方面板贴在一起；同时各面板自己的标题/工具条用的是 mb-3，
+     * 于是「有的地方 0、有的地方 12px」，看起来就是上下间距不协调。
+     *
+     * 现在统一由这里的几条规则给出节奏，不再依赖可能不存在的工具类：
+     *   顶部 24px / 区块之间 20px / 底部 48px
+     */
+    .app-body{ max-width:1360px; width:100%; margin:0 auto; padding:24px 28px 48px; }
+    /* 面板容器：每个面板自己负责内部间距，容器只给「与上一个区块」的统一间隔 */
+    .app-body > section{ margin-bottom:20px; }
+    .app-body > section:last-child{ margin-bottom:0; }
+    /* ==========================================================================
+       移动端（<=900px）：顶部图标栏 + 汉堡折叠
+       --------------------------------------------------------------------------
+       原实现是「侧栏改成横向排列表格」，有三个真实问题：
+         1. **导航不能折叠** —— `<nav>` 上的**内联** `flex-direction:column`
+            优先级高于媒体查询，整列 11 项竖排（实测高 397px），
+            把正文硬生生推下去（首屏内容顶到 662px）；
+         2. 11 个导航项横向排开需要 495px 宽，而机身只有 360~390px，
+            必然要横向滑动才能点到后半截的「设置」；
+         3. 品牌块与底部信息被 `flex` 拉成整列高（实测 brand 高 389px），
+            中间大片空白，观感很怪。
+
+       现在改成移动端该有的样子：
+         顶部一行 = 品牌图标 + 当前面板名 + 汉堡按钮；
+         点汉堡展开/收起导航抽屉（`position:absolute` 悬浮，不占正文空间）。
+       ========================================================================== */
+    @media (max-width:900px){
+      .app-shell{ flex-direction:column; }
+      .app-side{
+        width:auto; height:auto; position:sticky; top:0; z-index:40;
+        flex-direction:row; align-items:center; gap:8px;
+        padding:8px 12px; overflow:visible;
+        border-right:0; border-bottom:1px solid var(--border);
+      }
+      /* 顶栏：汉堡 + 品牌（品牌名在小屏可省） */
+      .side-brand{
+        display:flex; padding:0; margin:0; border-bottom:0; flex:1 1 auto; min-width:0;
+      }
+      .side-brand .side-title{ display:none; }   /* 只留图标，省横向空间 */
+      .side-toggle{ display:inline-flex; order:-1; }
+      /* 底部信息收进抽屉，不占顶栏 */
+      .side-foot{ display:none; }
+      /* 导航抽屉：**从左侧滑出**（不是从下方展开）。
+       * 左侧抽屉是移动端导航的通用心智模型，也让「汉堡在左、菜单也在左」
+       * 形成位置一致；从上方垂下来会盖住内容顶部，指向性也弱。 */
+      .side-nav{
+        display:flex; position:fixed; left:0; top:0; bottom:0;
+        width:min(78vw, 288px);
+        flex-direction:column; gap:2px; padding:14px 10px;
+        background:var(--surface); border-right:1px solid var(--border);
+        box-shadow:6px 0 28px rgba(15,23,42,.16);
+        overflow-y:auto; z-index:41;
+        /* 收起态：整体移出视口左侧 + 不可点 */
+        transform:translateX(-102%);
+        transition:transform .22s cubic-bezier(.2,.9,.3,1);
+        visibility:hidden;
+      }
+      .app-side.open .side-nav{
+        transform:translateX(0); visibility:visible;
+      }
+      /* 抽屉顶部补一个标题（左侧抽屉没有「顶栏」承接，需要自己的头部） */
+      .side-nav-head{
+        display:flex; align-items:center; justify-content:space-between;
+        padding:2px 6px 10px; margin-bottom:6px;
+        border-bottom:1px solid var(--border);
+        font-size:13px; font-weight:600; color:var(--fg);
+      }
+      .side-nav-head button{
+        width:30px; height:30px; border-radius:8px; border:0; cursor:pointer;
+        background:transparent; color:var(--fg-muted); font-size:14px;
+      }
+      .side-nav-head button:hover{ background:var(--surface-2); }
+      /* 抽屉展开时顶栏的汉堡按钮隐藏（抽屉自带关闭按钮，避免两个入口） */
+      .app-side.open .side-toggle{ visibility:hidden; }
+      .side-item{ width:100%; padding:11px 14px; font-size:14px; }
+      .app-body{ padding:16px 14px 32px; }
+    }
+    /* 桌面：抽屉头部隐藏（那是移动端专属） */
+    .side-nav-head{ display:none; }
+    @media (max-width:900px){ .side-nav-head{ display:flex; } }
+    /* 桌面：不显示「当前面板名」（侧栏本来就一眼看得见选中态）。
+     * **必须写在这个 @media 之前** —— 移动端要把它改成 display:block，
+     * 若桌面规则排在后面，同优先级下后者胜出，移动端就会一直是 none
+     * （踩过：面板名在手机上死活不显示）。 */
+    .side-current{ display:none; }
+    /* 移动端：顶栏显示当前面板名（抽屉收起时也知道自己在哪） */
+    @media (max-width:900px){
+      .side-current{
+        display:block; flex:0 1 auto; min-width:0;
+        font-size:13.5px; font-weight:600; color:var(--fg);
+        white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+      }
+      /* 有面板名时品牌块不抢宽度 */
+      .side-brand{ flex:0 0 auto; }
+    }
+    /* 抽屉里的退出入口：仅移动端需要（桌面底部已有），桌面隐藏避免重复 */
+    .side-item-quit{ display:none; }
+    @media (max-width:900px){
+      .side-item-quit{ display:flex; margin-top:6px; color:var(--danger); }
+      .side-item-quit:hover{ background:var(--danger-soft); color:var(--danger); }
+    }
+    /* 抽屉遮罩：移动端展开时点击空白处收起 */
+    .side-scrim{
+      display:none; position:fixed; inset:0; z-index:39;
+      background:rgba(15,23,42,.35);
+    }
+    @media (max-width:900px){
+      /* 遮罩淡入（与抽屉的位移动画同时进行，观感更连贯） */
+      .app-shell.menu-open .side-scrim{
+        display:block; animation:scrimIn .2s ease;
+      }
+      @keyframes scrimIn{ from{opacity:0;} to{opacity:1;} }
+    }
+    /* 指标卡网格：窄屏 2 列、中屏 4 列，避免「太挤」或「太空」 */
+    .stat-grid{ display:grid; gap:12px; grid-template-columns:repeat(2,minmax(0,1fr)); }
+    @media (min-width:760px){ .stat-grid{ grid-template-columns:repeat(4,minmax(0,1fr)); } }
+
+    /* 页头：22px 半粗标题 + 12.5px 次级说明（参考项目的排版比例）。
+     * 所有面板的页头都走这一份，保证「标题与下方内容的间距」处处一致。 */
+    .page-head{ display:flex; flex-wrap:wrap; align-items:flex-end; justify-content:space-between; gap:12px; margin:0 0 14px; }
+    .page-head h1{ font-size:22px; font-weight:600; letter-spacing:-.02em; margin:0; }
+    .page-head p{ margin:6px 0 0; font-size:12.5px; color:var(--fg-muted); line-height:1.6; }
+    .page-head > div:first-child{ min-width:0; flex:1 1 420px; }
+    .page-head > div:last-child{ flex:0 0 auto; }
+    /* 面板工具条（旧结构，各面板标题 + 按钮那一行）：与 .page-head 同节奏 */
+    .panel-toolbar{ margin-bottom:14px; }
+    .section-head{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 10px; }
+    .section-head h3{ font-size:13.5px; font-weight:600; margin:0; }
+    .section-head .hint{ font-size:11.5px; color:var(--fg-subtle); }
+    /* 面板内的说明段（标题下方那句灰字）：与内容保持 12px 节奏 */
+    .panel-note{ font-size:12px; color:var(--fg-muted); margin:0 0 12px; line-height:1.6; }
+
+    /* 指标卡：数值用大号等宽数字，标题用小号。
+     *
+     * 顶部卡片统一带一点**主题色的渐变**（品牌青绿，左上 → 右下微微淡出），
+     * 让首屏一眼就有品牌感，而不是四块纯白方块。
+     * 渐变刻意做得非常淡 —— 它是「底色」不是「色块」：
+     * 太重会跟橙色告警卡抢注意力，也会压低数字的可读性。 */
+    .stat{
+      position:relative; overflow:hidden;
+      background:linear-gradient(135deg, var(--brand-soft) 0%, transparent 58%), var(--surface);
+      border:1px solid var(--border); border-radius:var(--r); padding:14px 16px;
+    }
+    /* 右上角一团极淡的品牌色光晕（参考项目 account-card 的做法：
+     * 用模糊圆从边角溢出，而不是加边框或改底色）。 */
+    .stat::after{
+      content:""; position:absolute; right:-30px; top:-36px;
+      width:100px; height:100px; border-radius:9999px;
+      background:var(--brand); opacity:.13; filter:blur(20px);
+      pointer-events:none;
+    }
+    .stat .stat-label{ font-size:11.5px; color:var(--fg-muted); display:flex; align-items:center; gap:6px; position:relative; z-index:1; }
+    .stat .stat-value{ font-size:24px; font-weight:600; letter-spacing:-.025em; font-variant-numeric:tabular-nums; margin-top:6px; line-height:1.1; position:relative; z-index:1; }
+    .stat .stat-sub{ font-size:11px; color:var(--fg-subtle); margin-top:4px; position:relative; z-index:1; }
+    /* 告警态：橙色压过品牌绿（紧迫信息优先），同样用极淡的渐变 */
+    .stat.is-warn{
+      border-color:rgba(249,115,22,.38);
+      background:linear-gradient(135deg, var(--warn-soft) 0%, transparent 58%), var(--surface);
+    }
+    .stat.is-warn::after{ background:var(--warn-bar); opacity:.16; }
+    .stat.is-danger{ border-color:rgba(231,0,11,.30); }
+    .stat.is-danger::after{ background:var(--danger); opacity:.14; }
+    .stat.is-brand{ border-color:rgba(66,192,142,.34); }
+
+    /* 到期徽标：橙=7 天内，红=已到期，灰=长期有效（语义与参考项目一致） */
+    .exp-badge{
+      display:inline-flex; align-items:center; gap:4px; white-space:nowrap;
+      padding:1px 7px; border-radius:9999px; font-size:11px; font-weight:600;
+      font-variant-numeric:tabular-nums;
+    }
+    .exp-badge.soon{ background:var(--warn-soft); color:var(--warn); }
+    .exp-badge.dead{ background:var(--danger-soft); color:var(--danger); }
+    .exp-badge.ever{ background:var(--surface-2); color:var(--fg-muted); }
+    /* 明细行：数量 chip + 名称 + 到期日（参考项目的 CreditResourceRow 结构） */
+    .pkg-row{ padding:7px 0; border-top:1px solid var(--border-soft); }
+    .pkg-row:first-child{ border-top:0; }
+    .pkg-line{ display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:10px; font-size:12px; }
+    .pkg-amt{
+      border-radius:var(--r-sm); background:var(--surface-2);
+      padding:2px 7px; font-weight:600; font-variant-numeric:tabular-nums; color:var(--fg);
+    }
+    .pkg-track{ height:4px; border-radius:9999px; background:var(--surface-2); overflow:hidden; margin-top:5px; }
+    .pkg-track > i{ display:block; height:100%; border-radius:9999px; background:var(--brand); }
+    .pkg-track > i.soon{ background:var(--warn-bar); }
+    .pkg-track > i.dead{ background:var(--danger); }
+
+    /* 到期风险分档条：横向堆叠，一眼看出有多少额度落在哪一档 */
+    .risk-bar{ display:flex; height:10px; border-radius:9999px; overflow:hidden; background:var(--surface-2); }
+    .risk-bar > span{ display:block; height:100%; }
+
+    /* 表格：更轻的表头、行悬停反馈 */
+    .tbl{ width:100%; border-collapse:separate; border-spacing:0; font-size:13px; }
+    .tbl thead th{
+      background:var(--surface-2); color:var(--fg-muted); font-weight:500;
+      text-align:left; padding:9px 14px; white-space:nowrap;
+      position:sticky; top:0; z-index:1;
+    }
+    .tbl tbody td{ padding:9px 14px; border-top:1px solid var(--border-soft); vertical-align:middle; }
+    .tbl tbody tr:hover td{ background:rgba(15,23,42,.022); }
+    @media (prefers-color-scheme: dark){
+      .tbl tbody tr:hover td{ background:rgba(255,255,255,.035); }
+      .side-item:hover{ background:rgba(255,255,255,.06); }
+      .side-item.active{ background:rgba(255,255,255,.10); }
+    }
+
+    /* 空状态：虚线边框 + 安静文案（参考项目的 calm empty state） */
+    .empty{
+      border:1px dashed var(--border); border-radius:var(--r);
+      padding:36px 16px; text-align:center; font-size:12.5px; color:var(--fg-muted); line-height:1.7;
+    }
+
+    /* ==========================================================================
+       语义尺寸类（**不要**在这里之外用 Tailwind 的任意值类）
+       --------------------------------------------------------------------------
+       /static/vendor/tailwind/tailwind.min.css 是**预编译产物**，只含构建那一刻
+       用到的类。之后新写 `text-[11.5px]` 这类任意值类会**静默不生效** ——
+       不报错、不警告，只是样式没了（典型表现就是「有些地方没有样式」）。
+
+       所以固定尺寸统一在这里定义成语义类。改这些值只改一处，
+       也不会再依赖「运气好已经编译进去了」。
+       新增检查：`_zcode_probe/check_tailwind_classes.py` 会扫描全文，
+       把「引用了但 CSS 里不存在」的任意值类报出来。
+       ========================================================================== */
+    .fs-13-5{ font-size:13.5px; }
+    .fs-12-5{ font-size:12.5px; }
+    .fs-12{ font-size:12px; }
+    .fs-11-5{ font-size:11.5px; }
+    .fs-10-5{ font-size:10.5px; }
+    .fs-10{ font-size:10px; }
+    /* 滚动容器统一高度：长列表一律「固定高度 + 内部滚动」，
+     * 不让页面随着数据量无限变长（既难用，也让整页越滚越卡）。 */
+    .scroll-box{ overflow-y:auto; overscroll-behavior:contain; }
+    .scroll-box::-webkit-scrollbar{ width:8px; }
+    .scroll-28{ max-height:28rem; }
+    .scroll-34{ max-height:34rem; }
+    /* 表单筛选块的最小宽度：窄屏会自然换行 */
+    .fld-200{ flex:1 1 200px; min-width:200px; }
+    .fld-140{ flex:0 1 140px; min-width:130px; }
+    .fld-150{ flex:1 1 150px; min-width:150px; }
+    .fld-110{ flex:0 1 110px; min-width:100px; }
+    .minw-190{ min-width:190px; }
+    .maxw-45{ max-width:45%; }
+
+    /* ==========================================================================
+       间距 / 悬停语义类
+       --------------------------------------------------------------------------
+       下面这些原本写的是 Tailwind 工具类，但**预编译 CSS 里没有它们** ——
+       构建时没扫到，所以压根没被编译进去。表现就是「类名写了但间距不对」，
+       肉眼完全看不出（`mb-5` 与存在的 `mb-4` 长得一模一样）。
+
+       实测缺失清单：mb-5 gap-x-4 gap-y-1.5 pb-2 pb-4 px-2.5 m-0 mb-1.5
+       mt-auto hover:text-wb hover:opacity-80。
+
+       统一改成这里定义的语义类：语义明确、不依赖预编译内容，
+       而且以后调间距只改一处，不会再出现「有的生效有的不生效」。
+       ========================================================================== */
+    .mt-auto{ margin-top:auto; }
+    .m-0{ margin:0; }
+    .mb-1-5{ margin-bottom:6px; }
+    .pb-2{ padding-bottom:8px; }
+    .pb-4{ padding-bottom:16px; }
+    .px-2-5{ padding-left:10px; padding-right:10px; }
+    .gap-x-4{ column-gap:16px; }
+    .gap-y-1-5{ row-gap:6px; }
+    .hover-lift{ transition:opacity .15s; }
+    .hover-lift:hover{ opacity:.8; }
+    .hover-brand:hover{ color:var(--brand-ink); }
+    /* 页面主要区块之间的统一间隔（原来是 mb-5，那个类不存在所以为 0） */
+    .block-gap{ margin-bottom:20px; }
+
+    /* 页头与内容区的统一节奏：所有面板的顶部间距一致，
+     * 不再出现「有的面板贴着指标卡、有的空一大截」。 */
+    .panel-stack > section{ margin-top:0; }
+
     /* 移动端横向滚动条美化 */
     .overflow-x-auto::-webkit-scrollbar{ height:8px; }
     .overflow-x-auto::-webkit-scrollbar-thumb{ background:#d6d6dd; border-radius:8px; }
@@ -115,28 +529,93 @@
     }
     /* 状态/操作列不参与收缩，避免把胶囊压窄 */
     td.col-status, th.col-status{ width:1%; white-space:nowrap; }
-    /* tab 胶囊 */
-    .tab-btn{ transition:.15s; }
-    .tab-btn.active{ background:var(--wb-grad); color:#fff !important; box-shadow:0 4px 12px rgba(40,184,148,.35); }
     /* 分页按钮更大的可点区域 */
     .pg-btn{ min-width:34px; height:34px; }
-    /* modal 移动端占满 */
+    /* ==========================================================================
+       手机（<=640px）：紧凑排版
+       --------------------------------------------------------------------------
+       窄屏的核心矛盾是「宽表格 vs 窄屏」。策略：
+         * 表格保持横向滚动，**首列吸附**（sticky）—— 横滑时还能看出是哪一行；
+         * 页头/工具条纵向堆叠、按钮铺满（手指点得准）；
+         * 指标卡数值缩小一档，避免 24px 数字在 360px 宽里换行。
+       ========================================================================== */
     @media (max-width:640px){
       #modalBox{ width:94vw; padding:1rem; max-height:90vh; }
       /* 报表：首列吸附 + 更紧凑，横向滑动更好管理 */
       .card table td, .card table th{ padding:.55rem .6rem; }
       .card table td:first-child, .card table th:first-child{
-        position:sticky; left:0; z-index:2; background:#fff;
-        box-shadow:1px 0 0 var(--wb-border);
+        position:sticky; left:0; z-index:2; background:var(--surface);
+        box-shadow:1px 0 0 var(--border);
       }
-      .card table thead th:first-child{ background:var(--wb-surface); z-index:3; }
-      .card table tbody tr:hover td:first-child{ background:var(--wb-surface); }
+      .card table thead th:first-child{ background:var(--surface-2); z-index:3; }
+      .card table tbody tr:hover td:first-child{ background:var(--surface-2); }
       .overflow-x-auto{ -webkit-overflow-scrolling:touch; }
-      /* 窄屏工具栏纵向堆叠、按钮铺满 */
+      /* 页头：标题与按钮纵向堆叠，按钮铺满一行 */
+      .page-head{ flex-direction:column; align-items:stretch; gap:10px; }
+      .page-head > div:first-child{ flex:1 1 auto; }
+      .page-head > div:last-child{ width:100%; }
+      .page-head > div:last-child button{ flex:1 1 auto; }
+      .page-head h1{ font-size:19px; }
+      /* 旧结构的面板工具条同样堆叠 */
       .panel-toolbar{ flex-direction:column; align-items:stretch; }
       .panel-toolbar .tools{ width:100%; flex-wrap:wrap; }
       .panel-toolbar .tools button{ flex:1 1 auto; }
+      /* 指标卡：数值降一档，2 列在 360px 下才放得下 */
+      .stat{ padding:12px 13px; }
+      .stat .stat-value{ font-size:20px; }
+      .stat .stat-sub{ font-size:10.5px; }
+      .stat-grid{ gap:10px; }
+      /* 滚动容器的固定高度：手机上 34rem 太高，缩到 60vh 更合适 */
+      .scroll-34, .scroll-28{ max-height:60vh; }
+      /* 卡片内边距收紧，给正文让出横向空间 */
+      .card.p-4{ padding:12px; }
+      .app-body{ padding:14px 12px 28px; }
     }
+.acc-table{ width:100%; border-collapse:separate; border-spacing:0; font-size:12.5px; }
+.acc-table thead th{
+  background:var(--surface-2); color:var(--fg-muted); font-weight:500;
+  text-align:left; padding:8px 10px; white-space:nowrap;
+  position:sticky; top:0; z-index:1;
+}
+.acc-table tbody td{
+  padding:7px 10px; border-top:1px solid var(--border-soft);
+  vertical-align:middle; white-space:nowrap;
+}
+.acc-table tbody tr:hover td{ background:rgba(15,23,42,.022); }
+@media (prefers-color-scheme: dark){
+  .acc-table tbody tr:hover td{ background:rgba(255,255,255,.035); }
+}
+/* 名称列：**名字与 uid 同一行**。
+ * 原来分两行（名字一行、uid 一行）把行高顶到 50px；
+ * 合并后约 36px，一屏能多显示 4 行。uid 是次要信息，小字灰色跟在名字后面即可。 */
+.acc-table .c-name{
+  max-width:230px; overflow:hidden;
+}
+.acc-table .c-name .nm{
+  display:flex; align-items:baseline; gap:6px; min-width:0;
+}
+.acc-table .c-name .nm > b{
+  font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  max-width:130px;
+}
+.acc-table .c-uid{
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:10px;
+  color:var(--fg-subtle); overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; max-width:92px;
+}
+/* 操作按钮：图标密集但可点区域够大 */
+.acc-table .c-ops{ text-align:right; }
+.acc-table .c-ops button{
+  padding:3px 4px; border-radius:6px; font-size:12.5px; line-height:1;
+  transition:background .12s;
+}
+.acc-table .c-ops button:hover{ background:var(--surface-2); }
+/* 到期单元格：单行徽标 + 说明，不换行 */
+.acc-exp{
+  display:flex; align-items:center; gap:6px; white-space:nowrap;
+}
+.acc-exp .acc-exp-note{ font-size:11px; color:var(--fg-subtle); }
+
     /* 图表 tooltip（自绘：原生 <title> 延迟长、样式不可控） */
     #chartTip{
       position:fixed; z-index:80; pointer-events:none; display:none;
@@ -148,20 +627,21 @@
     .chart-hit{ cursor:pointer; }
     .chart-hit:hover{ opacity:.85; }
     input,select,textarea{ outline:none; }
-    input:focus,select:focus,textarea:focus{ border-color:var(--wb-primary); box-shadow:0 0 0 3px rgba(40,184,148,.15); }
+    input:focus,select:focus,textarea:focus{ border-color:var(--brand); box-shadow:0 0 0 3px var(--brand-soft); }
   </style>
 </head>
-<body class="text-slate-800">
+<body>
 
 <!-- 登录 -->
 <div id="login" class="min-h-screen flex items-center justify-center bg-wb">
-  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-8 fade-in">
+  <div class="rounded-2xl w-full max-w-sm p-8 fade-in"
+       style="background:var(--surface); box-shadow:var(--sh-2); border:1px solid var(--border)">
     <div class="text-center mb-6">
       <div class="w-14 h-14 rounded-2xl bg-wb flex items-center justify-center mx-auto">
         <i class="fa-solid fa-share-nodes text-2xl text-white"></i>
       </div>
       <h1 class="text-xl font-bold mt-4">WorkBuddy 共享管理后台</h1>
-      <p class="text-sm text-slate-400 mt-1">多账号轮换 · API Key 网关 · 模型配置</p>
+      <p class="text-sm mt-1" style="color:var(--fg-muted)">多账号轮换 · API Key 网关 · 模型配置</p>
     </div>
     <input id="username" class="w-full border rounded-lg px-3 py-2.5 mb-3 text-sm" placeholder="用户名" value="admin" />
     <input id="password" type="password" class="w-full border rounded-lg px-3 py-2.5 mb-4 text-sm" placeholder="密码" />
@@ -173,41 +653,70 @@
 </div>
 
 <!-- 主界面 -->
-<div id="app" class="hidden min-h-screen">
-  <header class="bg-white shadow-sm sticky top-0 z-30">
-    <div class="max-w-6xl mx-auto px-4 h-14 flex items-center justify-between">
-      <div class="flex items-center gap-2 font-bold text-wb">
-        <i class="fa-solid fa-share-nodes"></i> WorkBuddy 共享后台
+<div id="app" class="hidden">
+  <div class="app-shell">
+    <!-- 侧栏导航：桌面是固定侧栏；移动端折叠成顶部汉堡菜单
+         （点汉堡展开抽屉，点空白/选中项收起）。 -->
+    <aside class="app-side" id="appSide">
+      <button class="side-toggle" id="sideToggle" onclick="toggleSideMenu(event)"
+              aria-label="展开导航菜单" aria-expanded="false">
+        <i class="fa-solid fa-bars"></i>
+      </button>
+      <div class="side-brand">
+        <div class="w-9 h-9 rounded-xl bg-wb flex items-center justify-center shrink-0">
+          <i class="fa-solid fa-share-nodes text-white"></i>
+        </div>
+        <div class="min-w-0 side-title">
+          <div class="fs-13-5 font-semibold leading-tight" style="letter-spacing:-.02em">WorkBuddy</div>
+          <div class="text-[11px] leading-tight" style="color:var(--fg-subtle)">共享管理后台</div>
+        </div>
       </div>
-      <div class="flex items-center gap-3 text-sm">
-        <span id="proxyUrl" class="text-slate-400 hidden md:inline"></span>
-        <button onclick="logout()" class="text-slate-500 hover:text-red-500"><i class="fa-solid fa-right-from-bracket"></i> 退出</button>
+      <!-- 移动端顶栏显示的当前面板名（抽屉收起时也知道自己在哪） -->
+      <span class="side-current" id="sideCurrent">账号池</span>
+      <nav class="side-nav" id="sideNav">
+        <!-- 抽屉头部：左侧抽屉没有顶栏承接，需要自己的标题与关闭按钮 -->
+        <div class="side-nav-head">
+          <span>导航菜单</span>
+          <button onclick="closeSideMenu()" aria-label="关闭菜单"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <button class="side-item active" data-tab="accounts"><i class="fa-solid fa-user-group"></i> 账号池</button>
+        <!-- 积分到期：角标显示「7 天内到期的账号数」，
+             让用户在没打开面板时就能看到有额度要作废。 -->
+        <button class="side-item" data-tab="credits"><i class="fa-solid fa-hourglass-half"></i> 积分到期
+          <span class="side-dot hidden" id="sideExpiringDot">0</span></button>
+        <button class="side-item" data-tab="usage"><i class="fa-solid fa-chart-pie"></i> 使用记录</button>
+        <button class="side-item" data-tab="keys"><i class="fa-solid fa-key"></i> API Keys</button>
+        <button class="side-item" data-tab="models"><i class="fa-solid fa-shapes"></i> 模型配置</button>
+        <button class="side-item" data-tab="groups"><i class="fa-solid fa-layer-group"></i> 分组管理</button>
+        <button class="side-item" data-tab="schedules"><i class="fa-solid fa-clock-rotate-left"></i> 定时任务</button>
+        <button class="side-item" data-tab="logs"><i class="fa-solid fa-list"></i> 用量日志</button>
+        <button class="side-item" data-tab="client"><i class="fa-solid fa-fingerprint"></i> 客户端参数</button>
+        <button class="side-item" data-tab="sync"><i class="fa-solid fa-cloud-arrow-up"></i> 同步设置</button>
+        <button class="side-item" data-tab="settings"><i class="fa-solid fa-gear"></i> 设置</button>
+        <!-- 抽屉内的退出入口（移动端顶栏放不下，收进菜单更自然） -->
+        <button class="side-item side-item-quit" onclick="logout()"><i class="fa-solid fa-right-from-bracket"></i> 退出登录</button>
+      </nav>
+      <div class="side-foot">
+        <div id="proxyUrl" class="truncate mb-1-5"></div>
+        <button onclick="logout()" class="hover-lift"><i class="fa-solid fa-right-from-bracket mr-1"></i>退出登录</button>
       </div>
-    </div>
-  </header>
+    </aside>
+    <!-- 抽屉展开时的遮罩（点击收起） -->
+    <div class="side-scrim" id="sideScrim" onclick="closeSideMenu()"></div>
 
-  <main class="max-w-6xl mx-auto px-4 py-6">
-    <section id="overview" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6"></section>
-
-    <!-- Tabs -->
-    <div class="flex gap-2 border-b mb-4 overflow-x-auto pb-1">
-      <button class="tab-btn active px-4 py-2 text-sm font-medium rounded-full whitespace-nowrap" data-tab="accounts"><i class="fa-solid fa-user-group mr-1"></i> 账号</button>
-      <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="keys"><i class="fa-solid fa-key mr-1"></i> API Keys</button>
-      <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="models"><i class="fa-solid fa-shapes mr-1"></i> 模型配置</button>
-      <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="groups"><i class="fa-solid fa-layer-group mr-1"></i> 分组管理</button>
-      <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="usage"><i class="fa-solid fa-chart-pie mr-1"></i> 使用记录</button>
-      <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="schedules"><i class="fa-solid fa-clock-rotate-left mr-1"></i> 定时任务</button>
-      <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="logs"><i class="fa-solid fa-list mr-1"></i> 日志</button>
-      <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="client"><i class="fa-solid fa-fingerprint mr-1"></i> 客户端参数</button>
-      <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="sync"><i class="fa-solid fa-cloud-arrow-up mr-1"></i> 同步设置</button>
-      <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="settings"><i class="fa-solid fa-gear mr-1"></i> 设置</button>
-    </div>
+    <main class="app-main">
+      <div class="app-body">
+        <section id="overview" class="stat-grid block-gap"></section>
 
     <!-- 账号面板 -->
     <section id="panel-accounts">
-      <div class="flex flex-wrap justify-between items-center mb-3 gap-2 panel-toolbar">
-        <h2 class="font-semibold">账号池</h2>
-        <div class="flex flex-wrap gap-2 tools">
+      <div class="page-head">
+        <div>
+          <h1>账号池</h1>
+          <p>共 <span id="accHeadCount">-</span> 个账号。<b>积分到期</b>一列显示每个号最近要作废的积分包；
+             列表顺序不是调度的使用顺序（要看优先级请到「积分到期」）。</p>
+        </div>
+        <div class="flex flex-wrap gap-2">
           <button onclick="growthRunBatch()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="对全部账号：自动参与并完成可自动化的成长任务，然后领奖"><i class="fa-solid fa-seedling mr-1 text-emerald-600"></i> 批量做任务</button>
           <button onclick="catTravelBatch()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="对全部账号执行：领养(+300) → 派猫 → 领奖"><i class="fa-solid fa-cat mr-1 text-pink-600"></i> 猫猫旅行</button>
           <button onclick="scanLocal()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-magnifying-glass mr-1"></i> 扫描本机</button>
@@ -221,12 +730,17 @@
       <div class="flex gap-2 mb-3">
         <input id="accSearch" oninput="renderAccPage(1)" placeholder="搜索名称 / UID" class="w-full border rounded-lg px-3 py-2 text-sm" />
       </div>
+      <!-- 账号表：紧凑行（单行约 44px），一屏能看 12+ 行。
+           原来是 142px/行（到期列里塞了 2 个积分包明细），一屏只看 4 行。
+           积分明细移交给悬停 title 与「积分明细」弹窗。 -->
       <div class="card overflow-x-auto max-h-[70vh]">
-        <table class="w-full text-sm min-w-lg">
-          <thead class="bg-slate-50 text-slate-500 text-left sticky top-0">
+        <table class="acc-table" style="min-width:960px">
+          <thead>
             <tr>
-              <th class="px-4 py-3">名称</th><th class="px-4 py-3">UID</th><th class="px-4 py-3">状态</th>
-              <th class="px-4 py-3">总积分</th><th class="px-4 py-3">剩余</th><th class="px-4 py-3">同步</th><th class="px-4 py-3 text-right">操作</th>
+              <th>名称</th><th>状态</th>
+              <th class="text-right">总积分</th><th class="text-right">剩余</th>
+              <th>积分到期</th>
+              <th class="text-right">操作</th>
             </tr>
           </thead>
           <tbody id="accBody"></tbody>
@@ -241,7 +755,7 @@
       <div class="card p-4 mb-3">
         <div class="flex items-center justify-between mb-2">
           <h3 class="text-sm font-semibold text-wb"><i class="fa-solid fa-plug mr-1"></i> 对外对接信息（共享用）</h3>
-          <button onclick="loadShareInfo()" class="text-xs text-slate-400 hover:text-wb"><i class="fa-solid fa-rotate mr-1"></i>刷新</button>
+          <button onclick="loadShareInfo()" class="text-xs text-slate-400 hover-brand"><i class="fa-solid fa-rotate mr-1"></i>刷新</button>
         </div>
         <div class="grid gap-2 text-sm">
           <div class="flex items-center gap-2 flex-wrap">
@@ -447,39 +961,88 @@
       </div>
     </section>
 
-    <!-- 日志面板 -->
+    <!-- 用量日志面板 -->
     <section id="panel-logs" class="hidden">
-      <div class="flex flex-wrap justify-between items-center mb-3 gap-2">
-        <h2 class="font-semibold">用量日志</h2>
-        <div class="flex flex-wrap gap-2 items-center">
-          <input id="logStart" type="date" class="border rounded px-2 py-1.5 text-sm" title="起始日期" />
-          <span class="text-slate-400 text-sm">~</span>
-          <input id="logEnd" type="date" class="border rounded px-2 py-1.5 text-sm" title="结束日期" />
-          <input id="logModel" list="logModelList" placeholder="模型" class="border rounded px-2 py-1.5 text-sm w-36" />
-          <input id="logKey" list="logKeyList" placeholder="Key" class="border rounded px-2 py-1.5 text-sm w-36" />
-          <input id="logAccount" list="logAccList" placeholder="账号/UID" class="border rounded px-2 py-1.5 text-sm w-36" />
-          <input id="logIp" placeholder="客户端IP" class="border rounded px-2 py-1.5 text-sm w-32" />
-          <datalist id="logModelList"></datalist>
-          <datalist id="logKeyList"></datalist>
-          <datalist id="logAccList"></datalist>
-          <button onclick="loadLogs(1)" class="px-3 py-1.5 rounded-lg border text-sm"><i class="fa-solid fa-filter mr-1"></i> 筛选</button>
-          <button onclick="exportLogs()" class="px-3 py-1.5 rounded-lg border text-sm" title="导出 CSV"><i class="fa-solid fa-file-csv mr-1"></i> 导出</button>
-          <button onclick="loadLogs(_logPage)" class="px-3 py-1.5 rounded-lg border text-sm" title="刷新"><i class="fa-solid fa-rotate"></i></button>
+      <div class="page-head">
+        <div>
+          <h1>用量日志</h1>
+          <p>每次代理调用的原始记录。<b>按账号查询</b>支持名称模糊匹配（会列出全部匹配的账号，
+             不再只取第一个），并可按账号汇总看谁在用、用了多少。</p>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button onclick="exportLogs()" class="px-3 py-1.5 rounded-lg border text-sm" title="导出当前筛选结果为 CSV"><i class="fa-solid fa-file-csv mr-1"></i> 导出</button>
+          <button onclick="loadLogs(1)" class="px-3 py-1.5 rounded-lg border text-sm" title="刷新"><i class="fa-solid fa-rotate mr-1"></i> 刷新</button>
         </div>
       </div>
+
+      <!-- 按账号查询区：这是「使用记录再新增按账号查询」的入口 -->
+      <div class="card p-3 mb-4">
+        <div class="flex flex-wrap gap-2 items-end">
+          <div class="fld-200">
+            <div class="text-[11px] mb-1" style="color:var(--fg-muted)">按账号（窗口内有记录的）</div>
+            <div id="logAccountSel"></div>
+          </div>
+          <div class="fld-140">
+            <div class="text-[11px] mb-1" style="color:var(--fg-muted)">时间范围</div>
+            <div id="logDaysSel"></div>
+          </div>
+          <div class="fld-150">
+            <div class="text-[11px] mb-1" style="color:var(--fg-muted)">模型</div>
+            <input id="logModel" list="logModelList" placeholder="全部模型" class="w-full border rounded-lg px-3 py-2 text-sm" />
+            <datalist id="logModelList"></datalist>
+          </div>
+          <div class="fld-150">
+            <div class="text-[11px] mb-1" style="color:var(--fg-muted)">Key</div>
+            <input id="logKey" list="logKeyList" placeholder="全部 Key" class="w-full border rounded-lg px-3 py-2 text-sm" />
+            <datalist id="logKeyList"></datalist>
+          </div>
+          <div class="fld-110">
+            <div class="text-[11px] mb-1" style="color:var(--fg-muted)">客户端 IP</div>
+            <input id="logIp" placeholder="全部" class="w-full border rounded-lg px-3 py-2 text-sm" />
+          </div>
+        </div>
+        <div class="flex flex-wrap gap-2 items-end mt-2">
+          <div class="fld-140">
+            <div class="text-[11px] mb-1" style="color:var(--fg-muted)">起始日期</div>
+            <input id="logStart" type="date" class="w-full border rounded-lg px-2 py-2 text-sm" />
+          </div>
+          <div class="fld-140">
+            <div class="text-[11px] mb-1" style="color:var(--fg-muted)">结束日期</div>
+            <input id="logEnd" type="date" class="w-full border rounded-lg px-2 py-2 text-sm" />
+          </div>
+          <button onclick="loadLogs(1)" class="px-3 py-2 rounded-lg btn-primary text-sm"><i class="fa-solid fa-filter mr-1"></i> 查询</button>
+          <button onclick="resetLogFilters()" class="px-3 py-2 rounded-lg border text-sm"><i class="fa-solid fa-filter-circle-xmark mr-1"></i> 清除</button>
+          <!-- 关闭精确总数统计：日志量大时 COUNT(*) 本身就是一次完整索引扫描。
+               滚到后面时用户只关心「还有没有更多」，不关心精确总数。 -->
+          <label class="flex items-center gap-1.5 fs-11-5 px-1 pb-2" style="color:var(--fg-muted)"
+                 title="日志量大时，精确总数需要额外扫一遍索引；关掉可让翻页更快">
+            <input type="checkbox" id="logFastMode" onchange="loadLogs(1)" /> 快速翻页（不统计总数）
+          </label>
+        </div>
+        <div id="logFilterHint" class="text-[11px] mt-2 hidden"></div>
+      </div>
+
+      <!-- 按账号汇总：回答「这个号到底用了多少」，不必翻几十页日志去数 -->
+      <div class="card p-4 mb-4">
+        <div class="section-head">
+          <h3>按账号汇总</h3>
+          <span class="hint" id="logSummaryHint"></span>
+        </div>
+        <div id="logSummary" class="overflow-x-auto"></div>
+      </div>
+
       <div class="card overflow-hidden">
         <div class="overflow-x-auto max-h-[60vh]">
-          <table class="w-full text-sm min-w-sm">
-            <thead class="bg-slate-50 text-slate-500 text-left sticky top-0"><tr>
-              <th class="px-3 py-2.5">时间</th><th class="px-3 py-2.5">Key</th><th class="px-3 py-2.5">账号</th>
-              <th class="px-3 py-2.5">模型</th><th class="px-3 py-2.5">输入/输出/缓存</th>
-              <th class="px-3 py-2.5">积分</th><th class="px-3 py-2.5">延迟</th><th class="px-3 py-2.5">用途</th><th class="px-3 py-2.5">结果</th>
+          <table class="tbl" style="min-width:1080px">
+            <thead><tr>
+              <th>时间</th><th>Key</th><th>账号</th><th>模型</th><th>Token</th>
+              <th class="text-right">积分</th><th>耗时</th><th>用途</th><th>结果</th>
             </tr></thead>
             <tbody id="logBody"></tbody>
           </table>
         </div>
+        <div id="logPager" class="flex justify-between items-center px-4 py-3 text-sm" style="color:var(--fg-muted)"></div>
       </div>
-      <div id="logPager" class="flex justify-between items-center mt-3 text-sm text-slate-500"></div>
     </section>
 
     <!-- 客户端参数面板：UA / 版本号 / 风控头 / 桌面指纹 -->
@@ -553,6 +1116,98 @@
       </div>
     </section>
 
+    <!-- 积分到期面板：本次新增。
+         这是「快到期的先用完」这条调度策略的观察窗 —— 界面上排第一的账号
+         就是下一个会被选中的账号（排序与调度共用 admin/credits.urgency_rank）。
+         借鉴参考项目的「近期到期」与「积分总览」。 -->
+    <section id="panel-credits" class="hidden">
+      <div class="page-head">
+        <div>
+          <h1>积分到期</h1>
+          <p>按「离到期最近」排序 —— <b>列表第一个就是下一个会被优先使用的账号</b>。
+             平台按 7 天判定「快到期」，这部分额度不用完就会作废。</p>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button onclick="loadCreditStats(true)" id="creditSyncBtn"
+                  class="text-sm px-3 py-1.5 rounded-lg btn-primary"
+                  title="逐个账号重新采集上游积分包明细（串行，账号多时需要几十秒）">
+            <i class="fa-solid fa-cloud-arrow-down mr-1"></i> 重新采集</button>
+          <button onclick="loadCreditStats()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50">
+            <i class="fa-solid fa-rotate mr-1"></i> 刷新</button>
+        </div>
+      </div>
+
+      <div id="creditOverview" class="stat-grid mb-4"></div>
+
+      <!-- 到期风险分布：一眼看出有多少额度落在哪一档 -->
+      <div class="card p-4 mb-4">
+        <div class="section-head">
+          <h3>到期风险分布</h3>
+          <span class="hint" id="creditRiskHint"></span>
+        </div>
+        <div id="creditRiskBar"></div>
+      </div>
+
+      <div class="grid md:grid-cols-2 gap-4 mb-4">
+        <!-- 「最近快到期的积分包」：固定高度 + 内部滚动 + **滚到底自动加载**。
+             不做成长列表：包总数随「账号数 × 每号包数」增长（实测 400+），
+             一次全渲染会让页面越用越卡、越滚越长。
+             也不用「点按钮加载更多」—— 手动点多一次很烦，
+             滚动到底自动续上才是列表该有的手感。 -->
+        <div class="card p-4 flex flex-col">
+          <div class="section-head">
+            <h3>最近快到期的积分包</h3>
+            <span class="hint" id="creditPkgHint"></span>
+          </div>
+          <div id="creditPackages" class="scroll-box scroll-34"></div>
+          <div id="creditPkgMore" class="mt-2 shrink-0 hidden">
+            <div class="text-center fs-11-5 py-1" style="color:var(--fg-subtle)">
+              <i class="fa-solid fa-spinner fa-spin mr-1"></i>正在加载更多...
+            </div>
+          </div>
+        </div>
+        <!-- 按账号的消耗构成（借鉴参考项目的「账号消耗构成」） -->
+        <div class="card p-4 flex flex-col">
+          <div class="section-head">
+            <h3>账号消耗构成</h3>
+            <span class="hint" id="creditUsageHint"></span>
+          </div>
+          <div id="creditUsage" class="scroll-box scroll-34"></div>
+        </div>
+      </div>
+
+      <!-- 账号级到期明细 -->
+      <div class="card overflow-hidden mb-4">
+        <div class="flex flex-wrap items-center justify-between gap-2 px-4 py-3" style="border-bottom:1px solid var(--border)">
+          <div class="section-head" style="margin:0">
+            <h3>账号到期排行</h3>
+            <span class="hint" id="creditAccHint"></span>
+          </div>
+          <label class="flex items-center gap-1.5 fs-11-5" style="color:var(--fg-muted)">
+            <input type="checkbox" id="creditShowDisabled" onchange="loadCreditStats()" /> 含已禁用账号
+          </label>
+        </div>
+        <div class="overflow-x-auto max-h-[70vh]">
+          <table class="tbl" style="min-width:1000px">
+            <thead>
+              <tr>
+                <th style="width:38px">#</th>
+                <th>账号</th>
+                <th>状态</th>
+                <th class="text-right">剩余积分</th>
+                <th class="text-right">7 天内到期</th>
+                <th class="text-right">长期有效</th>
+                <th>最近到期</th>
+                <th>最近快到期的积分包</th>
+                <th class="text-right">操作</th>
+              </tr>
+            </thead>
+            <tbody id="creditBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
     <!-- 设置面板 -->
     <section id="panel-settings" class="hidden">
       <h2 class="font-semibold mb-3">管理员设置</h2>
@@ -623,12 +1278,15 @@
         <div id="appSourceMsg" class="text-sm text-slate-500 mt-3"></div>
       </div>
     </section>
-  </main>
+      </div>
+    </main>
+  </div>
 </div>
 
 <!-- 通用模态框 -->
 <div id="modal" class="fixed inset-0 modal-overlay hidden items-center justify-center z-50 p-3">
-  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-6xl p-6 fade-in max-h-[88vh] overflow-y-auto" id="modalBox"></div>
+  <div class="rounded-2xl w-full max-w-6xl p-6 fade-in max-h-[88vh] overflow-y-auto" id="modalBox"
+       style="background:var(--surface); box-shadow:var(--sh-pop); border:1px solid var(--border)"></div>
 </div>
 
 <div id="toasts" class="toast flex flex-col gap-2"></div>
@@ -881,7 +1539,11 @@ function logout() { localStorage.removeItem(TOKEN_KEY); location.reload(); }
 function enterApp() {
   $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
   $("#proxyUrl").textContent = location.origin + "/v1";
-  loadAccounts(); loadKeys(); loadModels(); loadSchedules(); loadLogs(); loadSyncConfig(); loadShareInfo();
+  // 首屏只拉「概览 + 账号池 + 侧栏角标」需要的数据。
+  // 日志（loadLogs）**有意不在这里调**：它要额外打 3 个请求（选项/汇总/列表），
+  // 而用户可能根本不打开日志面板 —— 让首屏为它付代价是纯浪费，
+  // 改成切到该面板时由 openLogsPanel() 按需加载。
+  loadAccounts(); loadKeys(); loadModels(); loadSchedules(); loadSyncConfig(); loadShareInfo();
   // 还原地址栏里的面板（刷新后停在原页面，而不是跳回「账号」首页）。
   // updateUrl:false —— 地址栏本来就是这个值，不必再写一次。
   activateTab(_tabFromUrl(), { updateUrl: false });
@@ -889,7 +1551,7 @@ function enterApp() {
 
 // Tabs
 // 面板清单与默认面板：默认面板不写进 URL（保持地址栏干净）。
-const TABS = ["accounts","keys","models","groups","usage","schedules","logs","client","sync","settings"];
+const TABS = ["accounts","credits","usage","keys","models","groups","schedules","logs","client","sync","settings"];
 const TAB_DEFAULT = "accounts";
 
 /** 从地址栏读当前应显示的面板；非法/缺失一律回落到默认面板。 */
@@ -911,12 +1573,17 @@ function _tabFromUrl() {
  */
 function activateTab(name, opts) {
   if (!TABS.includes(name)) name = TAB_DEFAULT;
-  document.querySelectorAll(".tab-btn").forEach(x => {
-    const on = x.dataset.tab === name;
-    x.classList.toggle("active", on);
-    x.classList.toggle("text-wb", on);
+  // 侧栏导航：active 由 .side-item.active 表达
+  document.querySelectorAll(".side-item").forEach(x => {
+    x.classList.toggle("active", x.dataset.tab === name);
   });
   TABS.forEach(t => { const el = $(`#panel-${t}`); if (el) el.classList.toggle("hidden", t !== name); });
+
+  // 移动端顶栏的「当前面板名」：抽屉收起时用户也得知道自己停在哪。
+  // 用 data-label / 首个文本节点，而**不是** textContent —— 后者会把
+  // 「积分到期」旁边的角标数字一起读进去（实测变成 "积分到期 3"）。
+  const cur = $("#sideCurrent");
+  if (cur) cur.textContent = _sideTabLabel(name);
 
   if (!opts || opts.updateUrl !== false) {
     try {
@@ -930,15 +1597,82 @@ function activateTab(name, opts) {
   // 切到这几个面板时按需拉数据（图表/分组列表/客户端参数不必在首屏就请求）
   if (name === "groups") loadGroups();
   if (name === "usage") loadUsageStats();
+  if (name === "credits") loadCreditStats();
+  if (name === "logs") openLogsPanel();
   if (name === "client") loadClientProfile();
   if (name === "settings") loadAppSource();
 }
 
-document.querySelectorAll(".tab-btn").forEach(b => b.onclick = () => activateTab(b.dataset.tab));
+/* ==========================================================================
+   移动端导航抽屉
+   --------------------------------------------------------------------------
+   桌面是固定侧栏，移动端折叠成汉堡菜单（样式见 <style> 的 @media 段落）。
+   这里只管开合状态，**不写死断点/宽度** —— 否则「什么时候该折叠」
+   会同时存在 CSS 与 JS 两处判断，迟早不一致。
+   ========================================================================== */
+
+/**
+ * 取某个面板的**纯文字**名称（用于移动端顶栏）。
+ *
+ * 为什么不用 `el.textContent`：导航项里可能夹着角标数字
+ * （「积分到期」右边有个待处理数），textContent 会把数字一起读进来，
+ * 顶栏就显示成「积分到期 3」。这里只取**第一个文本节点**。
+ */
+function _sideTabLabel(name) {
+  const el = document.querySelector(`.side-item[data-tab="${name}"]`);
+  if (!el) return name;
+  for (const node of el.childNodes) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const t = (node.textContent || "").trim();
+      if (t) return t;
+    }
+  }
+  return name;
+}
+function toggleSideMenu(ev) {
+  if (ev) ev.stopPropagation();
+  const shell = document.querySelector(".app-shell");
+  const aside = $("#appSide");
+  const btn = $("#sideToggle");
+  if (!shell || !aside) return;
+  const open = !aside.classList.contains("open");
+  aside.classList.toggle("open", open);
+  shell.classList.toggle("menu-open", open);
+  if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+function closeSideMenu() {
+  const shell = document.querySelector(".app-shell");
+  const aside = $("#appSide");
+  const btn = $("#sideToggle");
+  if (aside) aside.classList.remove("open");
+  if (shell) shell.classList.remove("menu-open");
+  if (btn) btn.setAttribute("aria-expanded", "false");
+}
+
+// 导航项：带 data-tab 的是面板切换（「退出登录」没有 data-tab，走自己的 onclick）。
+// 用 data-tab 存在性判断，比维护类名白名单更不容易漏。
+document.querySelectorAll(".side-item").forEach(b => {
+  b.addEventListener("click", () => {
+    if (b.dataset.tab) activateTab(b.dataset.tab);
+    closeSideMenu();          // 点任意项后都收起抽屉
+  });
+});
 
 // 前进/后退（含手改地址栏后回车）时同步面板。replaceState 不产生历史项，
-// 所以这只在用户真的跨页面前进后退时触发。
+// 所以这只在用户真的跨页面前进/后退时触发。
 window.addEventListener("popstate", () => activateTab(_tabFromUrl(), { updateUrl: false }));
+
+// 窄→宽切换时清掉抽屉状态：从手机转到桌面后若还留着 open/menu-open，
+// 桌面侧栏会带上移动端的展开态（遮罩也可能残留）。
+window.addEventListener("resize", () => {
+  if (window.innerWidth > 900) closeSideMenu();
+});
+
+// Esc 关闭抽屉（与关闭弹窗同键，行为一致）
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeSideMenu();
+});
 
 function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function card(t, v, ic, col) {
@@ -950,9 +1684,130 @@ function badge(st) {
   return `<span class="badge ${m[0]}">${m[1]}</span>`;
 }
 
-/* 列表分页（移动端友好） */
-const PS = 10;
+/* ==========================================================================
+   新版视觉组件（借鉴 workbuddy-switch 的设计系统）
+   --------------------------------------------------------------------------
+   旧函数 card()/badge() 保留不动：它们被十几处调用，逐个改的风险远大于收益。
+   新面板与重点区域统一用下面这几个，视觉上更接近参考项目：
+     * 数值等宽对齐（tabular-nums）—— 表格里数字不等宽会显得很廉价
+     * 语义色只用三档：橙=7 天内到期、红=已到期、灰=长期有效
+     * 卡片只用极淡的 slate 双层阴影，靠边框分隔而不是靠投影
+   ========================================================================== */
+
+/** 指标卡：大号等宽数值 + 小号标签，支持 brand/warn/danger 状态色。 */
+function statCard(label, value, opts) {
+  opts = opts || {};
+  const cls = opts.tone ? ` is-${opts.tone}` : "";
+  const icon = opts.icon ? `<i class="fa-solid ${opts.icon} ${opts.iconColor || ''}"></i>` : "";
+  const sub = opts.sub ? `<div class="stat-sub">${opts.sub}</div>` : "";
+  return `<div class="stat${cls}">
+    <div class="stat-label">${icon}${esc(label)}</div>
+    <div class="stat-value">${value}</div>${sub}</div>`;
+}
+
+/**
+ * 积分数值格式化。
+ *
+ * 分成两个函数，因为这两处的精度诉求**正好相反**：
+ *
+ *   `fmtCredit`      汇总/概览用 → **取整**。
+ *       顶部卡片的 69475.00 看着又长又乱，末尾两位小数对「我还有多少积分」
+ *       这个判断毫无信息量（对比 118030 的总额度，小数只是噪音）。
+ *
+ *   `fmtCreditExact` 单个积分包用 → 保留小数。
+ *       包级别的 459.49 / 459 是真实差异（一个包用到只剩 0.49），
+ *       抹成整数会让「这个包还剩多少」失真，对账时对不上。
+ */
+function fmtCredit(n) {
+  return String(Math.round(Number(n) || 0));
+}
+
+/** 单个积分包的精确保留（最多两位小数，整数不补 .00）。 */
+function fmtCreditExact(n) {
+  n = Number(n) || 0;
+  return Number.isInteger(n) ? String(n) : n.toFixed(2);
+}
+
+/**
+ * 到期徽标。三档语义色与参考项目一致（那边 expiryClass 用
+ * orange-600 / destructive / muted）：橙=7 天内、红=已到期、灰=长期有效。
+ * 「7 天内」用橙色而不是黄色，是因为它与「一般警告」不是一回事 ——
+ * 黄色在整套配色里已经用于「注意」，用它会稀释紧迫感。
+ */
+function expiryBadge(daysLeft, expired, expiringSoon) {
+  if (expired) return `<span class="exp-badge dead"><i class="fa-solid fa-circle-exclamation"></i>已到期</span>`;
+  if (daysLeft == null) return `<span class="exp-badge ever">长期有效</span>`;
+  const txt = daysLeft < 1 ? `${Math.max(1, Math.round(daysLeft * 24))} 小时内`
+                           : `${Math.floor(daysLeft)} 天后`;
+  return `<span class="exp-badge ${expiringSoon ? 'soon' : 'ever'}">${
+    expiringSoon ? '<i class="fa-solid fa-fire"></i>' : ''}${txt}</span>`;
+}
+
+/**
+ * 积分明细弹窗里的单行（比 pkgRowHtml 多显示总量与已用量）。
+ * 抽成独立函数是为了让「仍有剩余」与「已用完」两组共用同一份渲染 ——
+ * 两处各写一遍很容易在改动时只改一处，出现同一种包两种样式的割裂。
+ */
+function pkgDetailRow(p) {
+  const low = Number(p.remaining) <= 0;
+  const color = p.expired ? 'var(--danger)' : (p.expiringSoon ? 'var(--warn)' : 'var(--fg-muted)');
+  const dateTxt = p.expired ? "已到期"
+    : (p.expireDate && p.expireDate !== "长期有效" ? p.expireDate + " 到期" : p.expireLabel);
+  return `<div class="pkg-row"${low ? ' style="opacity:.55"' : ''}>
+    <div class="pkg-line">
+      <span class="pkg-amt">${fmtCreditExact(p.remaining)}</span>
+      <span class="truncate" style="color:var(--fg-muted)">
+        ${esc(p.displayName || "积分包")}
+        <span style="color:var(--fg-subtle)">/ ${fmtCreditExact(p.total)} · 已用 ${fmtCreditExact(p.used)}</span>${
+          low ? '<span style="color:var(--fg-subtle)"> · 已用完</span>' : ""}</span>
+      <span class="tnum" style="color:${color};font-weight:${p.expiringSoon || p.expired ? 600 : 400}">
+        ${esc(dateTxt)}</span>
+    </div>
+    <div class="pkg-track"><i class="${p.expired ? 'dead' : (p.expiringSoon ? 'soon' : '')}"
+      style="width:${p.total > 0 ? Math.min(100, Math.max(0, p.remaining / p.total * 100)) : 0}%"></i></div>
+  </div>`;
+}
+
+/**
+ * 单个积分包明细行（紧凑版：数量 chip + 包名 + 到期日 + 细进度条）。
+ *
+ * 结构本身就是参考项目 account-card.tsx 里 CreditResourceRow 的形态。
+ * 这个布局比「一张多列表格」信息密度更高，也更容易一眼看出「哪个包快没了」。
+ */
+function pkgRowHtml(p, opts) {
+  opts = opts || {};
+  const remaining = Number(p.remaining || 0);
+  const total = Number(p.total || 0);
+  const ratio = total > 0 ? Math.min(100, Math.max(0, remaining / total * 100)) : 0;
+  const tone = p.expired ? "dead" : (p.expiring_soon ? "soon" : "");
+  const showAccount = opts.showAccount !== false && p.account_name;
+  const dateTxt = p.expired ? "已到期" : (p.expire_date || "长期");
+  const color = p.expired ? 'var(--danger)' : (p.expiring_soon ? 'var(--warn)' : 'var(--fg-muted)');
+  return `<div class="pkg-row" title="${esc(p.display_name || '')} · 剩余 ${remaining} / ${total} · ${esc(p.expire_label || '长期有效')}">
+    <div class="pkg-line">
+      <span class="pkg-amt">${fmtCreditExact(remaining)}</span>
+      <span class="truncate" style="color:var(--fg-muted)">${esc(p.display_name || "积分包")}${
+        showAccount ? ` <span style="color:var(--fg-subtle)">· ${esc(p.account_name)}</span>` : ""}</span>
+      <span class="tnum" style="color:${color};font-weight:${p.expiring_soon || p.expired ? 600 : 400}">${esc(dateTxt)}</span>
+    </div>
+    <div class="pkg-track"><i class="${tone}" style="width:${ratio}%"></i></div>
+  </div>`;
+}
+
+/* 列表分页大小。
+ * 从 10 提到 20：账号表改成紧凑行（142px → ~44px）之后，一页 10 条
+ * 显得太碎（翻页比滚动还频繁）。20 条在一屏内用内部滚动就能扫完。 */
+const PS = 20;
 let _accData = [], _keyData = [], _modelData = [];
+/* 账号列表的 summary（含到期汇总）。积分到期面板直接复用它，
+ * 避免为「侧栏角标 / 概览卡」再打一次接口。 */
+let _accSummary = null;
+/* 积分到期面板的最近一次数据。
+ * 声明必须放在**使用它的函数之前**（这里是 refreshAcc）：
+ * `let` 在声明语句执行前处于 TDZ，声明靠后会让先调用的函数抛
+ * 「Cannot access before initialization」—— 同 _usageOpts 那条注释的坑。 */
+let _creditStats = null;
+let _creditSyncing = false;
 /* 按 id 取账号（用于弹窗标题等展示，避免调用方重复传名称） */
 function accById(id) { return _accData.find(a => a.id === id); }
 let _accTerm = "", _keyTerm = "", _modelTerm = "";
@@ -969,39 +1824,108 @@ function pagerHtml(total, page, totalPages, fn) {
 }
 
 /* ==================== 账号 ==================== */
-function accRow(a) {
-  return `
-    <tr class="border-t hover:bg-slate-50">
-      <td class="px-4 py-3 whitespace-nowrap">${esc(a.name || "未命名")}</td>
-      <td class="px-4 py-3 text-slate-500 font-mono text-xs whitespace-nowrap">${esc(a.uid || "-")}</td>
-      <td class="px-4 py-3 col-status">${badge(a.status)}</td>
-      <td class="px-4 py-3">${a.balance_total}</td>
-      <td class="px-4 py-3 font-medium whitespace-nowrap ${a.balance_remain>0?'text-emerald-600':'text-red-500'}">${a.balance_remain}</td>
-      <td class="px-4 py-3 text-slate-400 text-xs whitespace-nowrap">${fmtTime(a.last_sync_at)}</td>
-      <td class="px-4 py-3 text-right whitespace-nowrap">
-        <button onclick="growthTasks(${a.id},'${esc(a.name||'')}')" class="text-emerald-600 hover:text-emerald-800 mr-1" title="成长任务（查看/完成/领奖）"><i class="fa-solid fa-seedling"></i></button>
-        <button onclick="catTravel(${a.id})" class="text-pink-600 hover:text-pink-800 mr-1" title="猫猫旅行（领养/派猫/领奖）"><i class="fa-solid fa-cat"></i></button>
-        <button onclick="viewCreditDetails(${a.id},'${esc(a.name||'')}')" class="text-amber-600 hover:text-amber-800 mr-1" title="查看积分明细"><i class="fa-solid fa-list-ul"></i></button>
-        <button onclick="viewRequestUsage(${a.id},'${esc(a.name||'')}')" class="text-blue-600 hover:text-blue-800 mr-1" title="请求用量"><i class="fa-solid fa-chart-line"></i></button>
-        <button onclick="injectAcc(${a.id})" class="text-violet-600 hover:text-violet-800 mr-1" title="注入到本机客户端"><i class="fa-solid fa-right-to-bracket"></i></button>
-        <button onclick="refreshAcc(${a.id})" class="text-indigo-600 hover:text-indigo-800 mr-1" title="刷新余额"><i class="fa-solid fa-rotate"></i></button>
-        <button onclick="exportAcc(${a.id},'${esc(a.name||'')}')" class="text-sky-600 hover:text-sky-800 mr-1" title="导出该账号登录态（.info）"><i class="fa-solid fa-file-export"></i></button>
-        <button onclick="toggleAcc(${a.id},'${a.status==='active'?'disabled':'active'}')" class="text-slate-500 hover:text-slate-800 mr-1" title="启用/禁用"><i class="fa-solid fa-power-off"></i></button>
-        <button onclick="delAcc(${a.id})" class="text-red-500 hover:text-red-700" title="删除"><i class="fa-solid fa-trash"></i></button>
-      </td>
-    </tr>`;
+/**
+ * 账号行的「积分到期」单元格 —— **压成一行**。
+ *
+ * 之前这里渲染 2 个积分包完整明细（名称 + 数量 chip + 进度条），
+ * 每包约 50px，把行高撑到 142px，一屏只能看 4 行（原先能看 20 行）。
+ * 表格该用来横向扫读对比，明细应去弹窗/积分面板看。
+ *
+ * 现在：徽标（快到期额度）+ 最近到期的包名与日期 + 包数，全部一行内；
+ * 完整逐包明细挂到 `title`，鼠标悬停即可见 —— 信息没丢，只是不占版面。
+ */
+function accExpiryCell(a) {
+  const soon = Number(a.credits_expiring_soon || 0);
+  const next = a.credits_next_expiring || [];
+  if (!a.credits_synced_at) {
+    return `<span class="acc-exp">
+      <span class="exp-badge ever">未采集</span>
+      <span class="acc-exp-note">点「重新采集」</span></span>`;
+  }
+  const badge = soon > 0
+    ? `<span class="exp-badge soon"><i class="fa-solid fa-fire"></i>${fmtCredit(soon)}</span>`
+    : (a.credits_soonest_expire_at
+        ? expiryBadge(a.credits_soonest_days_left, false, false)
+        : `<span class="exp-badge ever">长期有效</span>`);
+  const first = next[0];
+  const note = first
+    ? `${esc((first.display_name || "积分包").slice(0, 8))} ${esc(first.expire_date || "")}`
+    : "无剩余包";
+  const cnt = `<span class="acc-exp-note">· ${a.credits_active_package_count || next.length} 包</span>`;
+  // 悬停看前 3 个包的完整信息（信息不丢，只不占版面）
+  const tip = next.slice(0, 3)
+    .map(p => `${p.display_name} 剩 ${fmtCreditExact(p.remaining)}/${fmtCreditExact(p.total)}`
+              + `，${p.expired ? "已到期" : p.expire_label}`)
+    .join("\n");
+  const tipAttr = tip ? ` title="${esc(tip)}"` : "";
+  return `<span class="acc-exp"${tipAttr}>${badge}
+    <span class="acc-exp-note">${note}</span>${cnt}</span>`;
 }
+
+function accRow(a) {
+  const soon = Number(a.credits_expiring_soon || 0);
+  // 图标操作按钮抽成数组：顺序/配色一处可调，比 9 个 button 平铺更好维护
+  const ops = [
+    [`growthTasks(${a.id},'${esc(a.name||'')}')`, "fa-seedling", "text-emerald-600", "成长任务"],
+    [`catTravel(${a.id})`, "fa-cat", "text-pink-600", "猫猫旅行"],
+    [`viewCreditDetails(${a.id},'${esc(a.name||'')}')`, "fa-list-ul", "text-amber-600", "积分明细（逐包到期日）"],
+    [`viewRequestUsage(${a.id},'${esc(a.name||'')}')`, "fa-chart-line", "text-blue-600", "请求用量"],
+    [`injectAcc(${a.id})`, "fa-right-to-bracket", "text-violet-600", "注入本机客户端"],
+    [`refreshAcc(${a.id})`, "fa-rotate", "text-indigo-600", "刷新余额与到期快照"],
+    [`exportAcc(${a.id},'${esc(a.name||'')}')`, "fa-file-export", "text-sky-600", "导出登录态"],
+    [`toggleAcc(${a.id},'${a.status==='active'?'disabled':'active'}')`, "fa-power-off", "text-slate-500", "启用/禁用"],
+    [`delAcc(${a.id})`, "fa-trash", "text-red-500", "删除"],
+  ];
+  return `<tr>
+    <td class="c-name">
+      <div class="nm">
+        <b title="${esc(a.name || "未命名")}">${esc(a.name || "未命名")}</b>
+        <span class="c-uid" title="${esc(a.uid || "")}">${esc(a.uid || "-")}</span>
+      </div>
+    </td>
+    <td class="col-status">${badge(a.status)}</td>
+    <td class="tnum text-right" style="color:var(--fg-muted)">${a.balance_total}</td>
+    <td class="tnum text-right font-medium ${a.balance_remain>0?'text-emerald-600':'text-red-500'}">
+      ${a.balance_remain}${soon > 0 ? `<span class="fs-10-5" style="color:var(--warn)"> (${fmtCredit(soon)})</span>` : ""}
+    </td>
+    <td>${accExpiryCell(a)}</td>
+    <td class="c-ops">${ops.map(([fn, ic, col, ttl]) =>
+      `<button onclick="${fn}" class="${col}" title="${ttl}"><i class="fa-solid ${ic}"></i></button>`).join("")}</td>
+  </tr>`;
+}
+
 async function loadAccounts() {
   const r = await api("/api/accounts"); if (!r.ok) return;
   const d = await r.json();
   const s = d.summary;
+  const soon = Number(s.credits_expiring_soon || 0);
+  const soonest = s.soonest_expire_at
+    ? expiryBadge((s.soonest_expire_at - Date.now()) / 86400000, false, true) : "";
   $("#overview").innerHTML = `
-    ${card("账号总数", s.total, "fa-users", "text-indigo-600")}
-    ${card("可用账号", s.available, "fa-circle-check", "text-emerald-600")}
-    ${card("总积分", s.balance_total, "fa-coins", "text-amber-600")}
-    ${card("总剩余", s.balance_remain, "fa-wallet", "text-rose-600")}`;
+    ${statCard("账号总数", s.total, { icon:"fa-users", iconColor:"text-slate-400",
+        sub: `启用 ${s.active} · 可用 ${s.available}` })}
+    ${statCard("总剩余积分", fmtCredit(s.balance_remain), { icon:"fa-wallet", iconColor:"text-slate-400",
+        tone: soon > 0 ? "warn" : "brand", sub: `总额度 ${fmtCredit(s.balance_total)}` })}
+    ${statCard("7 天内到期", fmtCredit(soon), { icon:"fa-fire", iconColor:"text-orange-500",
+        tone: soon > 0 ? "warn" : "brand",
+        sub: soon > 0 ? `${s.expiring_accounts} 个账号 · 不用完会作废` : "暂无即将作废的额度" })}
+    ${statCard("最紧迫账号", s.expiring_accounts ? s.expiring_accounts + " 个待烧" : "无",
+        { icon:"fa-hourglass-half", iconColor:"text-slate-400",
+          tone: s.expiring_accounts ? "brand" : "",
+          sub: soonest ? `最近 ${soonest.replace(/<[^>]+>/g, "")}` : "全部长期有效" })}`;
+  const headCount = $("#accHeadCount");
+  if (headCount) headCount.textContent = s.total;
   _accData = d.items || [];
+  _accSummary = s;
   renderAccPage(1);
+  // 侧栏角标：没打开积分面板也能看到「有额度要作废」
+  const dot = $("#sideExpiringDot");
+  if (dot) {
+    const n = Number(s.expiring_accounts || 0);
+    dot.classList.toggle("hidden", n <= 0);
+    dot.textContent = n;
+    dot.title = `${n} 个账号有 7 天内到期的积分`;
+  }
 }
 function renderAccPage(p) {
   const term = (_accTerm = ($("#accSearch") ? $("#accSearch").value : "").trim().toLowerCase());
@@ -1010,10 +1934,22 @@ function renderAccPage(p) {
   p = Math.min(Math.max(1, p), totalPages);
   const slice = data.slice((p - 1) * PS, p * PS);
   $("#accBody").innerHTML = slice.map(accRow).join("") ||
-    `<tr><td colspan="7" class="px-4 py-8 text-center text-slate-400">${term ? "无匹配的账号" : "还没有账号，点「批量上传」"}</td></tr>`;
+    `<tr><td colspan="6" class="px-4 py-8 text-center text-slate-400">${term ? "无匹配的账号" : "还没有账号，点「批量上传」"}</td></tr>`;
   $("#accPager").innerHTML = pagerHtml(total, p, totalPages, "renderAccPage");
 }
-async function refreshAcc(id){ const r=await api("/api/accounts/"+id+"/refresh",{method:"POST"}); toast(r.ok?"余额已刷新":"刷新失败", r.ok?"ok":"err"); if(r.ok) loadAccounts(); }
+async function refreshAcc(id){
+  const r = await api("/api/accounts/"+id+"/refresh",{method:"POST"});
+  const { ok, data } = await safeJson(r);
+  if (r.ok) {
+    // 刷新现在会一并更新积分到期快照（后端 with_expiry 默认开），
+    // 所以提示里带上「7 天内到期」的数字 —— 这才是用户刷新想确认的事。
+    const soon = Number((data && data.credits_expiring_soon) || 0);
+    toast(soon > 0 ? `已刷新：${soon} 积分将在 7 天内到期` : "余额与积分到期快照已刷新");
+  } else {
+    toast("刷新失败" + (data && data.detail ? "：" + data.detail : ""), "err");
+  }
+  if (r.ok) { loadAccounts(); if (_creditStats) loadCreditStats(); }
+}
 async function toggleAcc(id,st){ await api("/api/accounts/"+id,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:st})}); loadAccounts(); }
 async function delAcc(id){ if(!await uiConfirm({message:"确认删除该账号？", title:"删除账号"}))return; const r=await api("/api/accounts/"+id,{method:"DELETE"}); toast(r.ok?"已删除":"删除失败",r.ok?"ok":"err"); if(r.ok) loadAccounts(); }
 async function injectAcc(id){
@@ -1127,7 +2063,7 @@ function jobProgressRows(d, opts) {
     return `<div class="flex items-center gap-2 py-1.5 border-b last:border-0">
       ${icon}
       <span class="flex-1 truncate">${esc(label)}</span>
-      <span class="text-slate-500 text-xs truncate max-w-[45%]">${esc(detail)}</span>
+      <span class="text-slate-500 text-xs truncate maxw-45">${esc(detail)}</span>
       ${amount}
     </div>`;
   }).join("") || `<div class="text-slate-400 text-xs py-2">等待第一个账号完成...</div>`;
@@ -1581,45 +2517,70 @@ async function growthRunBatch(){
   });
 }
 
-/* 积分明细 */
-async function viewCreditDetails(id, name){
-  openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-list-ul mr-1"></i> 积分明细 — ${esc(name)}</h3><p class="text-xs text-slate-400 mb-3">加载中...</p><div id="creditDetailBody"></div>
+/* 积分明细（全部积分包，按到期升序）
+ *
+ * 优先用库内快照（秒开）；点「重新采集」才真调上游。这是本次的性能取向：
+ * 打开弹窗时再打一次上游，每个号要等 0.4s，用户只是想看一眼而已。
+ * 到期口径由后端 admin/credits.py 统一处理，前端只负责展示 ——
+ * 之前前端自己用 `new Date(p.deduction_end)` 判过期，踩的就是
+ * 2034 占位值被当成真实到期日的坑（那个包永远显示「未过期」）。 */
+async function viewCreditDetails(id, name, force){
+  openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-list-ul mr-1"></i> 积分明细 — ${esc(name)}</h3>
+    <div class="flex items-center justify-between mb-3 gap-2">
+      <p class="text-xs m-0" style="color:var(--fg-muted)">按到期时间升序 —— 排最前的就是最先作废的包。</p>
+      <button onclick="viewCreditDetails(${id},'${esc(name)}',true)" id="cdReloadBtn"
+              class="text-xs px-2-5 py-1.5 rounded-lg border hover:bg-slate-50 whitespace-nowrap">
+        <i class="fa-solid fa-cloud-arrow-down mr-1"></i>重新采集</button>
+    </div>
+    <div id="creditDetailBody"><p class="text-sm" style="color:var(--fg-subtle)">加载中...</p></div>
     <div class="flex justify-end mt-4"><button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button></div>`);
   try {
-    const r = await api("/api/accounts/"+id+"/credit-details");
+    const r = await api("/api/accounts/"+id+"/credit-details" + (force ? "?refresh=true" : ""));
     const { ok, data:d } = await safeJson(r);
     if(!r.ok){ $("#creditDetailBody").innerHTML = `<p class="text-red-500 text-sm">获取失败: ${esc(d.detail||"未知错误")}</p>`; return; }
-    const pkgs = d.packages || [];
-    let totalRemain = 0, totalSize = 0, totalUsed = 0, totalAccountRemain = 0;
-    for(const p of pkgs){ totalRemain += p.remain||0; totalSize += p.total||0; totalUsed += p.used||0; totalAccountRemain += p.account_remain||0; }
+    const c = d.credits || {};
+    // 「积分明细」要看**全量**（含已用完的，用户需要确认某个包确实用完了），
+    // 而且后端已按到期升序排好 —— 前端不再自己排，避免两处排序口径漂移。
+    const rs = c.all_resources || c.resources || [];
+    const active = rs.filter(p => Number(p.remaining) > 0);
+    const usedUp = rs.filter(p => Number(p.remaining) <= 0);
+    const soon = Number(c.expiring_soon_remaining || 0);
+    const stale = d.source === "cache"
+      ? `<span class="exp-badge ever"><i class="fa-solid fa-clock-rotate-left"></i>本地快照</span>` : "";
+
     $("#creditDetailBody").innerHTML = `
-      <div class="mb-3 p-3 bg-slate-50 rounded-lg flex flex-wrap gap-6 text-sm">
-        <div><span class="text-slate-400">合计总量:</span> <strong>${totalSize}</strong></div>
-        <div><span class="text-slate-400">合计剩余(周期):</span> <strong class="${totalRemain>0?'text-emerald-600':'text-red-500'}">${totalRemain}</strong></div>
-        <div><span class="text-slate-400">账号层级剩余:</span> <strong class="text-slate-600">${totalAccountRemain}</strong></div>
-        <div><span class="text-slate-400">已用:</span> <strong class="text-slate-600">${totalUsed}</strong></div>
-        <div><span class="text-slate-400">包数:</span> <strong>${pkgs.length}</strong></div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+        ${statCard("当前剩余", fmtCredit(c.total_remaining),
+            { icon:"fa-wallet", iconColor:"text-slate-400", sub:`总额度 ${fmtCredit(c.total_capacity)}` })}
+        ${statCard(`${c.expiring_soon_days || 7} 天内到期`, fmtCredit(soon),
+            { icon:"fa-fire", iconColor:"text-orange-500", tone: soon > 0 ? "warn" : "",
+              sub: soon > 0 ? "不用完会作废" : "暂无即将作废" })}
+        ${statCard("最近到期", c.soonest_days_left != null
+              ? (c.soonest_days_left < 1
+                  ? Math.max(1, Math.round(c.soonest_days_left * 24)) + " 小时内"
+                  : Math.floor(c.soonest_days_left) + " 天后")
+              : "长期有效",
+            { icon:"fa-hourglass-half", iconColor:"text-slate-400",
+              tone: soon > 0 ? "warn" : "", sub: esc(c.soonest_expire_at
+                  ? fmtTime(new Date(c.soonest_expire_at).toISOString().replace('T',' ').slice(0,19)) : "") })}
+        ${statCard("积分包", `${active.length} / ${rs.length}`,
+            { icon:"fa-boxes-stacked", iconColor:"text-slate-400",
+              sub: active.length < rs.length ? `已用完 ${rs.length - active.length} 个` : "全部仍有剩余" })}
       </div>
-      <div class="rounded-lg border overflow-x-auto">
-        <table class="w-full text-sm min-w"><thead class="bg-slate-50 text-slate-500 text-left sticky top-0"><tr>
-          <th class="px-3 py-2">包名称</th><th class="px-3 py-2">总量</th><th class="px-3 py-2">周期剩余</th><th class="px-3 py-2">账号剩余</th><th class="px-3 py-2">已用</th>
-          <th class="px-3 py-2">周期开始</th><th class="px-3 py-2">周期结束(到期)</th><th class="px-3 py-2">绝对到期</th><th class="px-3 py-2">进度</th>
-        </tr></thead><tbody>${
-          pkgs.length ? pkgs.map(p => {
-            const pct = p.total > 0 ? ((p.remain/p.total)*100).toFixed(0) : 0;
-            const isExpired = p.deduction_end ? (new Date(p.deduction_end) < new Date()) :
-                               (p.cycle_end ? (new Date(p.cycle_end) < new Date()) : false);
-            return `<tr class="border-t"><td class="px-3 py-2 max-w-[220px] truncate" title="${esc(p.name)}">${esc(p.name)}</td>
-              <td class="px-3 py-2">${p.total}</td>
-              <td class="px-3 py-2 ${p.remain>0?'text-emerald-600':'text-slate-400'}">${p.remain}${isExpired?' <span class="text-[10px] text-red-500 font-bold">已过期</span>':''}</td>
-              <td class="px-3 py-2 text-slate-500">${p.account_remain||0}</td>
-              <td class="px-3 py-2 text-slate-500">${p.used||0}</td>
-              <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap">${p.cycle_start || '-'}</td>
-              <td class="px-3 py-2 text-xs whitespace-nowrap ${isExpired&&!p.deduction_end?'text-red-500':''}">${p.cycle_end || '-'}</td>
-              <td class="px-3 py-2 text-xs whitespace-nowrap ${isExpired&&p.deduction_end?'text-red-500':''}">${p.deduction_end || (p.deduction_end_ts?'永不过期':'-')}</td>
-              <td class="px-3 py-2"><div class="w-24 h-2 bg-slate-200 rounded-full overflow-hidden"><div class="h-full ${p.remain>0?(isExpired?'bg-amber-500':'bg-emerald-500'):'bg-red-400'}" style="width:${pct}%"></div></div> <span class="text-[10px] text-slate-400">${pct}%</span></td></tr>`;
-          }).join('') : '<tr><td colspan="9" class="px-3 py-6 text-center text-slate-400">无积分包数据</td></tr>'
-        }</tbody></table>
+      ${d.error ? `<div class="mb-3 fs-11-5" style="color:var(--danger)">
+        <i class="fa-solid fa-triangle-exclamation mr-1"></i>上游采集失败（显示的是本地快照）：${esc(d.error)}</div>` : ""}
+      <div class="flex items-center gap-2 mb-2 text-[11px]">${stale}
+        <span style="color:var(--fg-subtle)">${d.source === "live" ? "本次已从上游采集" : "来自本地快照，可点「重新采集」更新"}</span>
+        <span style="color:var(--fg-subtle)">· 按到期时间升序</span></div>
+      <div class="card p-3">
+        ${active.length ? active.map(p => pkgDetailRow(p)).join("")
+          : `<div class="empty">该账号没有仍有剩余的积分包。</div>`}
+        ${usedUp.length ? `
+          <details class="mt-2">
+            <summary class="cursor-pointer fs-11-5 select-none py-1"
+                     style="color:var(--fg-muted)">已用完的 ${usedUp.length} 个包（点击展开）</summary>
+            <div class="mt-1">${usedUp.map(p => pkgDetailRow(p)).join("")}</div>
+          </details>` : ""}
       </div>`;
   } catch(e) { $("#creditDetailBody").innerHTML = `<p class="text-red-500 text-sm">请求异常: ${esc(e.message)}</p>`; }
 }
@@ -1828,6 +2789,328 @@ async function refreshAll(){
   const r=await api("/api/accounts"); if(!r.ok)return; const ids=(await r.json()).items.map(x=>x.id);
   for(const id of ids){ await api("/api/accounts/"+id+"/refresh",{method:"POST"}); }
   toast("全部刷新完成"); loadAccounts();
+}
+
+/* ==========================================================================
+   积分到期面板（这是「快到期的先用完」这条策略的观察窗）
+   --------------------------------------------------------------------------
+   借鉴参考项目 workbuddy-switch 的两处：
+     * 「近期到期」——把最近要作废的积分包直接摊开，而不是只给一个总额
+     * 「积分总览 / 账号消耗构成」——把存量（还剩多少、多久到期）与
+       流量（谁在烧）放在一起看，才能判断「调度到底有没有把快过期的用掉」
+
+   关键设计：**排序与后端调度共用同一套分级**（admin/credits.urgency_rank）。
+   界面上排第一的账号就是下一个会被选中的账号 —— 两处口径一旦不一致，
+   用户会认为调度坏了，而实际只是排序不同。
+   ========================================================================== */
+
+async function loadCreditStats(sync) {
+  if (sync) {
+    if (_creditSyncing) { toast("正在采集中，请稍候", "err"); return; }
+    _creditSyncing = true;
+    const btn = $("#creditSyncBtn");
+    const old = btn ? btn.innerHTML : "";
+    if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> 采集中...'; }
+    try {
+      // 逐号串行采集，账号多时会到几十秒 —— 给明确的等待提示，
+      // 而不是让界面静默卡住（用户会以为点坏了）。
+      toast("开始重新采集全部账号的积分到期快照…");
+      const r = await api("/api/accounts/credits/sync", { method: "POST" });
+      const { ok, data } = await safeJson(r);
+      if (!ok) { toast("采集失败: " + (data.detail || ""), "err"); return; }
+      const failed = data.failed || 0;
+      toast(`采集完成：成功 ${data.refreshed}/${data.total}`
+        + (failed ? `，${failed} 个失败` : "")
+        + (data.credits_expiring_soon ? `，7 天内到期 ${data.credits_expiring_soon}` : ""));
+      loadAccounts();   // 概览卡与侧栏角标同步刷新
+    } catch (e) {
+      toast("采集异常: " + (e && e.message ? e.message : e), "err");
+    } finally {
+      _creditSyncing = false;
+      if (btn) { btn.disabled = false; btn.innerHTML = old; }
+    }
+  }
+
+  const includeDisabled = $("#creditShowDisabled") ? $("#creditShowDisabled").checked : false;
+  const r = await api("/api/credits/expiry?include_disabled=" + (includeDisabled ? "true" : "false"));
+  const { ok, data } = await safeJson(r);
+  if (!ok) { toast("加载积分到期失败: " + (data.detail || ""), "err"); return; }
+  _creditStats = data;
+  renderCreditOverview(data);
+  renderCreditRisk(data);
+  renderCreditPackages(data);
+  renderCreditUsage(data);
+  renderCreditAccounts(data);
+}
+
+/** 概览卡：存量 + 风险 + 最紧迫账号。 */
+function renderCreditOverview(d) {
+  const s = d.summary;
+  const box = $("#creditOverview");
+  if (!box) return;
+  const atRisk = Number(s.at_risk_ratio || 0) * 100;
+  box.innerHTML = `
+    ${statCard("总剩余积分", fmtCredit(s.total_remaining), {
+        icon:"fa-wallet", iconColor:"text-slate-400", tone:"brand",
+        sub:`${s.accounts} 个账号 · ${s.expiring_packages} 个快到期包` })}
+    ${statCard(`${d.expiring_soon_days} 天内到期`, fmtCredit(s.expiring_soon_remaining), {
+        icon:"fa-fire", iconColor:"text-orange-500",
+        tone: s.expiring_soon_remaining > 0 ? "warn" : "brand",
+        sub: s.expiring_soon_remaining > 0
+          ? `占全部剩余 ${atRisk.toFixed(1)}% · 不用完会作废`
+          : "暂无即将作废的额度" })}
+    ${statCard("长期有效", fmtCredit(s.evergreen_remaining), {
+        icon:"fa-infinity", iconColor:"text-slate-400", tone:"brand",
+        sub:"没有作废风险，留到最后用" })}
+    ${statCard("最紧迫账号", s.soonest_account_name || "无", {
+        icon:"fa-hourglass-half", iconColor:"text-slate-400",
+        tone: s.expiring_soon_remaining > 0 ? "warn" : "brand",
+        sub: s.soonest_days_left != null
+          ? `${s.soonest_days_left < 1
+              ? Math.max(1, Math.round(s.soonest_days_left * 24)) + " 小时内到期"
+              : Math.floor(s.soonest_days_left) + " 天后到期"}`
+          : "全部长期有效" })}
+    ${s.expired_remaining > 0 ? `<div style="grid-column:1/-1" class="fs-11-5 px-1"
+        style="color:var(--danger)"><i class="fa-solid fa-triangle-exclamation mr-1"></i>
+        有 ${fmtCredit(s.expired_remaining)} 积分已过期但账面仍有剩余（上游扣减延迟），建议核对。</div>` : ""}`;
+}
+
+/** 到期风险分布：把各时间档要作废的额度画成一条堆叠条 + 图例。 */
+function renderCreditRisk(d) {
+  const box = $("#creditRiskBar");
+  const hint = $("#creditRiskHint");
+  if (!box) return;
+  const wins = (d.windows || []).filter(w => w.amount > 0);
+  const total = Number(d.summary.total_remaining || 0);
+  const evergreen = Number(d.summary.evergreen_remaining || 0);
+  if (hint) hint.textContent = total > 0 ? `共 ${fmtCredit(total)} 积分，按到期时间分档` : "";
+  if (!wins.length) {
+    box.innerHTML = `<div class="empty">没有任何即将到期的额度 —— 全部积分包都是长期有效或已清空。</div>`;
+    return;
+  }
+  const colors = ["var(--danger)", "var(--warn-bar)", "#f59e0b", "#84cc16", "var(--c1)"];
+  // windows 是**累计**金额（≤1 天 / ≤3 天 / …），画堆叠条要取增量才不重叠。
+  // 各段之和必然 ≤ total，但可能不等于 total：
+  //   * 30 天以外的有限期额度（有到期日但很远）既不在任何档里，也
+  //     不属于「长期有效」—— 用一个中性灰段把它显示出来，
+  //     否则条形图会「看起来少了一截」而没有任何解释。
+  let prev = 0;
+  const segs = wins.map((w, i) => {
+    const delta = Math.max(0, w.amount - prev);
+    prev = w.amount;
+    const pct = total > 0 ? Math.max(0.6, delta / total * 100) : 0;
+    return `<span style="width:${pct}%;background:${colors[i % colors.length]}"
+      title="≤${w.days} 天到期：${fmtCredit(delta)} 积分（${w.packages} 个包）"></span>`;
+  }).join("");
+  const rest = Math.max(0, total - prev - evergreen);
+  const everPct = total > 0 ? Math.max(0, evergreen / total * 100) : 0;
+  const restPct = total > 0 ? Math.max(0, rest / total * 100) : 0;
+  box.innerHTML = `
+    <div class="risk-bar mb-3">${segs}${
+      restPct > 0.4 ? `<span style="width:${restPct}%;background:var(--c8)"
+        title="30 天以外到期：${fmtCredit(rest)} 积分"></span>` : ""}${
+      everPct > 0.4 ? `<span style="width:${everPct}%;background:var(--surface-3)"
+        title="长期有效：${fmtCredit(evergreen)} 积分"></span>` : ""}</div>
+    <div class="flex flex-wrap gap-x-4 gap-y-1-5 fs-11-5" style="color:var(--fg-muted)">
+      ${wins.map((w, i) => `<span class="flex items-center gap-1.5">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${colors[i % colors.length]}"></span>
+        ≤${w.days} 天：<b class="tnum" style="color:var(--fg)">${fmtCredit(w.amount)}</b>
+        <span style="color:var(--fg-subtle)">（${w.packages} 个包）</span></span>`).join("")}
+      ${rest > 0 ? `<span class="flex items-center gap-1.5">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--c8)"></span>
+        30 天以外：<b class="tnum" style="color:var(--fg)">${fmtCredit(rest)}</b></span>` : ""}
+      <span class="flex items-center gap-1.5">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--surface-3)"></span>
+        长期有效：<b class="tnum" style="color:var(--fg)">${fmtCredit(evergreen)}</b></span>
+    </div>`;
+}
+
+/** 「最近快到期的积分包」：逐包平铺、按到期升序，**分页 + 滚动到底自动加载**。
+ *
+ * 后端一页只给 60 条（总包数实测 400+ 且会随账号数继续长）。
+ * 已加载的页累积在 `_creditPkgLoaded`，用户滚到接近底部时自动取下一页 ——
+ * 不用手动点按钮（手点很烦），也不会把整页拉成无限长（那会越用越卡）。
+ */
+let _creditPkgLoaded = [];      // 已加载的包（按到期升序拼接）
+let _creditPkgLoading = false;  // 防重入：一次只发一个续页请求
+let _creditPkgScrollBound = false;
+
+function renderCreditPackages(d) {
+  const box = $("#creditPackages");
+  const hint = $("#creditPkgHint");
+  if (!box) return;
+  _creditPkgLoaded = d.packages || [];     // 重新加载面板时重置为第一页
+  _creditPkgLoading = false;
+  const total = Number(d.packages_total || _creditPkgLoaded.length);
+  if (hint) {
+    hint.textContent = total
+      ? `按到期升序 · 已显示 ${_creditPkgLoaded.length}/${total} 个`
+      : "";
+  }
+  if (!_creditPkgLoaded.length) {
+    box.innerHTML = `<div class="empty">没有仍有剩余的积分包。<br>点右上「重新采集」从上游拉取最新明细。</div>`;
+    updateCreditPkgMore(false);
+    return;
+  }
+  box.innerHTML = _creditPkgLoaded.map(p => pkgRowHtml(p)).join("");
+  box.scrollTop = 0;
+  updateCreditPkgMore(!!d.has_more);
+  bindCreditPkgScroll();
+}
+
+/**
+ * 绑定「滚动到底自动续页」。
+ *
+ * 为什么用 `scroll` 事件 + 阈值而不是 IntersectionObserver：
+ * 容器固定高度、滚动的是容器本身（不是 window），scroll 事件最直观可靠，
+ * 且不需要维护观察者生命周期。**只绑一次**（`_creditPkgScrollBound` 守卫），
+ * 否则每次重新渲染都会叠加一个监听器，滚动一次触发 N 次请求。
+ */
+function bindCreditPkgScroll() {
+  const box = $("#creditPackages");
+  if (!box || _creditPkgScrollBound) return;
+  _creditPkgScrollBound = true;
+  box.addEventListener("scroll", () => {
+    if (_creditPkgLoading) return;
+    // 距底部 120px 内就预取下一页 —— 等真正见底再加载会有一段空白等待
+    const nearBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 120;
+    if (!nearBottom) return;
+    const total = Number((_creditStats && _creditStats.packages_total) || 0);
+    if (total && _creditPkgLoaded.length >= total) return;   // 已取完
+    loadMoreCreditPackages();
+  }, { passive: true });
+}
+
+/**
+ * 续页提示行的显隐。
+ *
+ * `loading=true` 时才显示「正在加载更多」。
+ * 注意**不能**用「has_more 就显示」—— 滚动加载的场景下，绝大多数时间
+ * 都不是在加载，一直挂个转圈会让用户以为卡住了（这正是第一版的 bug）。
+ * 全部取完后 `has_more=false`，此时也不显示。
+ */
+function updateCreditPkgMore(hasMore, loading) {
+  const wrap = $("#creditPkgMore");
+  if (!wrap) return;
+  wrap.classList.toggle("hidden", !loading);
+}
+
+/** 取下一页积分包并**追加**到列表（不重建整页，滚动位置不跳）。 */
+async function loadMoreCreditPackages() {
+  if (_creditPkgLoading) return;
+  _creditPkgLoading = true;
+  updateCreditPkgMore(true, true);
+  try {
+    const r = await api(`/api/credits/expiry?package_offset=${_creditPkgLoaded.length}&package_limit=60`);
+    const { ok, data } = await safeJson(r);
+    if (!ok) { toast("加载失败：" + (data.detail || ""), "err"); return; }
+    const box = $("#creditPackages");
+    const add = data.packages || [];
+    if (box && add.length) {
+      // 追加而不是整体重建：避免滚动位置跳回顶部（用户正在往下翻）
+      box.insertAdjacentHTML("beforeend", add.map(p => pkgRowHtml(p)).join(""));
+    }
+    _creditPkgLoaded = _creditPkgLoaded.concat(add);
+    if (_creditStats) {           // 让「总数」与后续判断保持一致
+      _creditStats.packages_total = data.packages_total;
+      _creditStats.has_more = data.has_more;
+    }
+    const hint = $("#creditPkgHint");
+    const total = Number(data.packages_total || _creditPkgLoaded.length);
+    if (hint) {
+      hint.textContent = `按到期升序 · 已显示 ${_creditPkgLoaded.length}/${total} 个`
+        + (data.has_more ? "" : " · 已全部加载");
+    }
+  } catch (e) {
+    toast("加载异常：" + (e && e.message ? e.message : e), "err");
+  } finally {
+    _creditPkgLoading = false;
+    updateCreditPkgMore(false, false);   // 加载结束即隐藏转圈
+  }
+}
+
+/** 账号消耗构成：谁在烧积分（数据源 usage_logs 的积分聚合）。 */
+async function renderCreditUsage(d) {
+  const box = $("#creditUsage");
+  const hint = $("#creditUsageHint");
+  if (!box) return;
+  box.innerHTML = `<div class="fs-12-5 py-4 text-center" style="color:var(--fg-subtle)">加载中...</div>`;
+  try {
+    const r = await api("/api/credits/usage?days=7&top=12");
+    const { ok, data } = await safeJson(r);
+    if (!ok) { box.innerHTML = `<div class="empty">加载失败：${esc(data.detail || "")}</div>`; return; }
+    const rows = (data.accounts || []).filter(x => x.credits > 0);
+    const maxC = Math.max(1, ...rows.map(x => x.credits));
+    if (hint) hint.textContent = `近 ${data.range_days} 天 · 合计 ${fmtCredit(data.total_credits)} 积分`;
+    if (!rows.length) {
+      box.innerHTML = `<div class="empty">近 ${data.range_days} 天没有产生积分消耗。</div>`;
+      return;
+    }
+    box.innerHTML = `<div class="flex flex-col gap-2.5">${rows.map(x => {
+      const w = Math.max(2, x.credits / maxC * 100);
+      const soonTag = x.expiring_soon_remaining > 0
+        ? `<span class="exp-badge soon">${fmtCredit(x.expiring_soon_remaining)} 将到期</span>` : "";
+      return `<div>
+        <div class="flex items-center justify-between gap-2 fs-12-5">
+          <span class="truncate font-medium">${esc(x.account_name)}</span>
+          <span class="shrink-0 tnum" style="color:var(--fg-muted)">
+            <b style="color:var(--fg)">${fmtCredit(x.credits)}</b> 积分
+            <span style="color:var(--fg-subtle)">· ${x.requests} 次</span></span>
+        </div>
+        <div class="pkg-track" style="margin-top:4px"><i style="width:${w}%"></i></div>
+        <div class="flex items-center gap-2 fs-10-5 mt-1" style="color:var(--fg-subtle)">
+          <span>剩余 ${fmtCredit(x.remaining)}</span>${soonTag}
+        </div>
+      </div>`;
+    }).join("")}</div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="empty">加载异常：${esc(String(e && e.message || e))}</div>`;
+  }
+}
+
+/** 账号到期排行：与调度同序（最紧迫的在最前）。 */
+function renderCreditAccounts(d) {
+  const body = $("#creditBody");
+  const hint = $("#creditAccHint");
+  if (!body) return;
+  const rows = d.accounts || [];
+  if (hint) hint.textContent = `${rows.length} 个账号 · 与调度优先级同序`;
+  if (!rows.length) {
+    body.innerHTML = `<tr><td colspan="9"><div class="empty">没有账号。先在「账号池」里添加。</div></td></tr>`;
+    return;
+  }
+  body.innerHTML = rows.map((a, i) => {
+    const soon = Number(a.expiring_soon_remaining || 0);
+    const expired = Number(a.expired_remaining || 0);
+    const rank = i + 1;
+    // 前三名给「快到期」的视觉权重 —— 这三个人就是接下来会被优先使用的号
+    const rankHtml = soon > 0 && rank <= 3
+      ? `<span class="exp-badge soon" title="调度会优先使用这个账号">${rank}</span>`
+      : `<span class="tnum" style="color:var(--fg-subtle)">${rank}</span>`;
+    const next = (a.next_expiring || []).slice(0, 2)
+      .map(p => pkgRowHtml(p, { showAccount: false })).join("");
+    const disabled = a.status !== "active"
+      ? `<span class="fs-10-5" style="color:var(--fg-subtle)">（不参与调度）</span>` : "";
+    return `<tr>
+      <td class="align-top">${rankHtml}</td>
+      <td class="align-top">
+        <div class="font-medium">${esc(a.account_name)}</div>
+        <div class="fs-10-5 font-mono" style="color:var(--fg-subtle)">${esc(a.uid || "-")}</div>
+      </td>
+      <td class="align-top">${badge(a.status)}${disabled}</td>
+      <td class="align-top text-right tnum font-medium">${fmtCredit(a.total_remaining)}</td>
+      <td class="align-top text-right tnum" style="color:${soon > 0 ? 'var(--warn)' : 'var(--fg-subtle)'};font-weight:${soon > 0 ? 600 : 400}">
+        ${soon > 0 ? fmtCredit(soon) : "—"}</td>
+      <td class="align-top text-right tnum" style="color:var(--fg-muted)">${fmtCredit(a.evergreen_remaining)}</td>
+      <td class="align-top">${expiryBadge(a.soonest_days_left, expired > 0 && a.soonest_expire_at === null, a.expiring_soon)}
+        ${a.synced_at ? `<div class="text-[10px] mt-0.5" style="color:var(--fg-subtle)">${fmtTime(new Date(a.synced_at).toISOString().replace('T',' ').slice(0,19), false)} 采集</div>` : ""}</td>
+      <td class="align-top" style="min-width:230px">${next || `<span class="text-[11px]" style="color:var(--fg-subtle)">没有仍有剩余的积分包</span>`}</td>
+      <td class="align-top text-right whitespace-nowrap">
+        <button onclick="viewCreditDetails(${a.account_id},'${esc(a.account_name)}')" class="text-amber-600 hover:text-amber-800 mr-1" title="查看全部积分包"><i class="fa-solid fa-list-ul"></i></button>
+        <button onclick="refreshAcc(${a.account_id}).then(loadCreditStats)" class="text-indigo-600 hover:text-indigo-800" title="重新采集该账号"><i class="fa-solid fa-rotate"></i></button>
+      </td>
+    </tr>`;
+  }).join("");
 }
 
 /* ==================== 手机号登录（全自动授权换凭证） ====================
@@ -3226,59 +4509,264 @@ async function submitSchedule(id){
   else { const d=await r.json().catch(()=>({})); toast("保存失败: "+(d.detail||""),"err"); }
 }
 
-/* ==================== 用量日志（服务端分页） ==================== */
+/* ==========================================================================
+   用量日志（服务端分页 + 按账号查询）
+   --------------------------------------------------------------------------
+   本次的三处改进（都对应原来真实的「慢 / 查不到」问题）：
+
+   1. **按账号下拉**：只列「窗口内真的产生过请求」的账号，并带上请求数与
+      最近使用时间。原来是一个自由文本框 + datalist，用户选中一个从没被
+      用过的号会筛出空结果，以为功能坏了。
+   2. **名称模糊匹配不再丢记录**：后端已改成返回完整 id 集合
+      （原来 `.scalar()` 只取第一条），前端这次也把筛选值从「名称文本」
+      换成「账号 id」，避免重名再一次造成歧义。
+   3. **快速翻页**：日志量大时 `COUNT(*)` 本身就是一次完整索引扫描。
+      关掉总数统计后，走 keyset 游标（`before_id`）翻页 ——
+      `WHERE id < N ORDER BY id DESC LIMIT n` 只走主键索引，
+      不再有 `OFFSET 100000` 那种「先扫掉十万行再丢弃」的开销。
+   ========================================================================== */
 let _logPage = 1, _logPageSize = 20;
-async function loadLogs(page){
-  _logPage = page || 1;
+let _logOpts = { accounts: [] };
+let _logBeforeId = null;      // keyset 游标
+let _logSelReady = false;
+
+/** 只渲染一次：账号与时间范围两个下拉。 */
+function initLogSelects() {
+  if (_logSelReady) return;
+  const daysBox = $("#logDaysSel");
+  if (daysBox) daysBox.outerHTML = uiSelectHTML("logDaysSel", {
+    value: "1",
+    options: [
+      { value: "1", label: "近 1 天" }, { value: "3", label: "近 3 天" },
+      { value: "7", label: "近 7 天" }, { value: "30", label: "近 30 天" },
+      { value: "0", label: "不限时间" },
+    ],
+    onChange: () => { loadLogAccounts(); loadLogSummary(); loadLogs(1); },
+  });
+  _logSelReady = true;
+}
+
+/** 按账号下拉：选项来自 /api/logs/accounts（窗口内有记录的账号）。 */
+async function loadLogAccounts() {
+  const days = parseInt(uiSelectValue("logDaysSel") || "1", 10) || 1;
+  let items = [];
+  try {
+    const r = await api(`/api/logs/accounts?days=${days}`);
+    const { ok, data } = await safeJson(r);
+    if (ok) items = data.items || [];
+  } catch (e) { /* 选项拉取失败不阻塞列表 */ }
+  _logOpts.accounts = items;
+
+  const cur = uiSelectValue("logAccountSel") || "";
+  const vals = items.map(x => String(x.id));
+  const keep = (cur && vals.includes(cur)) ? cur : "";
+  const box = $("#logAccountSel");
+  if (box) {
+    box.outerHTML = uiSelectHTML("logAccountSel", {
+      value: keep,
+      options: [{ value: "", label: `全部账号（${items.length} 个有记录）` }].concat(
+        items.map(x => ({
+          value: String(x.id),
+          // 选项里直接带上「请求数 · 积分」，让用户**选之前**就知道值不值得点
+          label: `${x.name} · ${x.requests} 次 · ${fmtCredit(x.credits)} 积分`,
+        }))),
+      onChange: () => loadLogs(1),
+    });
+  }
+}
+
+/** 当前筛选 → query string，并生成一句人话提示。 */
+function _logQuery() {
+  const days = parseInt(uiSelectValue("logDaysSel") || "1", 10) || 0;
+  const accountId = uiSelectValue("logAccountSel") || "";
   const model = ($("#logModel") ? $("#logModel").value : "").trim();
   const key = ($("#logKey") ? $("#logKey").value : "").trim();
-  const account = ($("#logAccount") ? $("#logAccount").value : "").trim();
   const ip = ($("#logIp") ? $("#logIp").value : "").trim();
   const start = ($("#logStart") ? $("#logStart").value : "").trim();
   const end = ($("#logEnd") ? $("#logEnd").value : "").trim();
-  const q = `page=${_logPage}&page_size=${_logPageSize}`
-    + (model ? `&model=${encodeURIComponent(model)}` : "")
-    + (key ? `&key=${encodeURIComponent(key)}` : "")
-    + (account ? `&account=${encodeURIComponent(account)}` : "")
-    + (ip ? `&client_ip=${encodeURIComponent(ip)}` : "")
-    + (start ? `&start=${encodeURIComponent(start + " 00:00:00")}` : "")
-    + (end ? `&end=${encodeURIComponent(end + " 23:59:59")}` : "");
-  const r = await api("/api/logs?"+q); if(!r.ok) return; const d = await r.json();
-  fillLogDatalists();
-  const total = d.total, totalPages = Math.max(1, Math.ceil(total/_logPageSize));
-  $("#logBody").innerHTML = (d.items||[]).map(l => {
-    const tokenHtml = (l.prompt_tokens!=null || l.completion_tokens!=null)
-      ? `<div class="leading-tight text-[11px]"><div><i class="fa-solid fa-arrow-down text-emerald-500 text-[10px]"></i> ${fmtK(l.prompt_tokens||0)} <i class="fa-solid fa-arrow-up text-amber-500 text-[10px] ml-1"></i> ${fmtK(l.completion_tokens||0)}</div><div class="text-slate-400"><i class="fa-solid fa-memory text-[9px] mr-0.5"></i> ${fmtK(l.cached_tokens||0)}</div></div>`
-      : `<span class="text-slate-400 text-xs">—</span>`;
-    const credHtml = l.credits>0
-      ? `<span class="text-emerald-600 font-semibold">${Number(l.credits).toFixed(4)}</span>`
-      : `<span class="text-slate-400">—</span>`;
-    function ttfbColor(ms){ if(ms==null) return 'text-slate-400'; if(ms<=3000) return 'text-emerald-600'; if(ms<=8000) return 'text-amber-500'; if(ms<=20000) return 'text-orange-500'; return 'text-red-500'; }
-    function totalColor(ms){ if(ms==null) return 'text-slate-400'; if(ms<=15000) return 'text-emerald-600'; if(ms<=30000) return 'text-amber-500'; if(ms<=60000) return 'text-orange-500'; return 'text-red-500'; }
-    function latencyBar(ms){ if(ms==null) return 0; const w = Math.min(100, Math.max(4, Math.log10(ms/100+1)*22)); return w.toFixed(1); }
-    const ttfbS = l.ttfb_ms!=null ? (l.ttfb_ms/1000).toFixed(2)+'s' : '—';
-    const latS = l.latency_ms!=null ? (l.latency_ms/1000).toFixed(2)+'s' : '—';
-    const latencyHtml = l.ttfb_ms!=null || l.latency_ms!=null
-      ? `<div class="leading-tight text-[11px]"><div class="flex items-center gap-1"><span class="w-7 text-slate-400">首字</span><span class="font-medium ${ttfbColor(l.ttfb_ms)}">${ttfbS}</span></div><div class="flex items-center gap-1 mt-0.5"><span class="w-7 text-slate-400">总</span><div class="flex items-center gap-1.5 flex-1"><div class="h-1.5 rounded-full bg-slate-200 overflow-hidden w-12"><div class="h-full rounded-full ${totalColor(l.latency_ms).replace('text-','bg-')}" style="width:${latencyBar(l.latency_ms)}%"></div></div><span class="font-medium ${totalColor(l.latency_ms)}">${latS}</span></div></div></div>`
-      : `<span class="text-slate-400 text-xs">—</span>`;
-    const ok = !l.error_kind || l.error_kind === 'success';
-    const statusHtml = ok
-      ? `<span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-emerald-100 text-emerald-600 text-xs" title="成功"><i class="fa-solid fa-check"></i></span>`
-      : `<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700" title="${esc(l.error_kind||'')}">${esc((l.error_kind||'失败').slice(0,4))}</span>`;
-    return `<tr class="border-t hover:bg-slate-50" title="IP: ${esc(l.client_ip||'—')} | Seq: ${l.seq||'—'}">
-      <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap">${fmtTime(l.created_at)}</td>
-      <td class="px-3 py-2 text-xs font-mono text-slate-600" title="${esc(l.key_name)}">${esc((l.key_name||'').slice(0,10))}</td>
-      <td class="px-3 py-2 text-xs text-slate-600" title="${esc(l.account_name)}">${esc((l.account_name||'').slice(0,12))}</td>
-      <td class="px-3 py-2 font-mono text-[11px] text-slate-600 whitespace-nowrap" title="${esc(l.model)}">${esc((l.model||'').slice(0,24))}</td>
-      <td class="px-3 py-2">${tokenHtml}</td>
-      <td class="px-3 py-2 text-xs">${credHtml}</td>
-      <td class="px-3 py-2">${latencyHtml}</td>
-      <td class="px-3 py-2 text-xs text-slate-500" title="透传给上游的 X-Agent-Purpose">${esc((l.use_case||'—').slice(0,14))}</td>
-      <td class="px-3 py-2">${statusHtml}</td>
-    </tr>`;
-  }).join("") || `<tr><td colspan="9" class="px-4 py-8 text-center text-slate-400">暂无日志（代理产生调用后这里会记录）</td></tr>`;
-  $("#logPager").innerHTML = pagerHtml(total, _logPage, totalPages, "loadLogs");
+  const fast = $("#logFastMode") ? $("#logFastMode").checked : false;
+
+  const p = new URLSearchParams({ page: _logPage, page_size: _logPageSize });
+  if (accountId) p.set("account_id", accountId);
+  if (model) p.set("model", model);
+  if (key) p.set("key", key);
+  if (ip) p.set("client_ip", ip);
+  // 时间范围：显式日期优先，否则用「近 N 天」自动算起点（0 = 不限）
+  if (start) p.set("start", start + " 00:00:00");
+  else if (days > 0) {
+    const d0 = new Date(Date.now() - days * 86400000);
+    p.set("start", d0.toISOString().slice(0, 19).replace("T", " "));
+  }
+  if (end) p.set("end", end + " 23:59:59");
+  if (fast) {
+    p.set("with_total", "false");
+    if (_logBeforeId) p.set("before_id", _logBeforeId);
+  }
+
+  const acc = (_logOpts.accounts || []).find(x => String(x.id) === accountId);
+  const conds = [];
+  if (acc) conds.push(`账号=${acc.name}`);
+  if (model) conds.push(`模型=${model}`);
+  if (key) conds.push(`Key=${key}`);
+  if (ip) conds.push(`IP=${ip}`);
+  if (start || end) conds.push(`日期=${start || "…"}~${end || "…"}`);
+  else if (days > 0) conds.push(`近 ${days} 天`);
+  if (fast) conds.push("快速翻页");
+  return { qs: p.toString(), conds };
 }
+
+async function loadLogs(page) {
+  initLogSelects();
+  if (!_logSelReady) return;
+  if (!_logOpts.accounts.length) await loadLogAccounts();
+  _logPage = page || 1;
+  if (_logPage === 1) _logBeforeId = null;   // 回到第一页即重置游标
+
+  const { qs, conds } = _logQuery();
+  const hint = $("#logFilterHint");
+  if (hint) {
+    if (conds.length) {
+      hint.classList.remove("hidden");
+      hint.innerHTML = `<i class="fa-solid fa-filter mr-1"></i>已筛选：${esc(conds.join("，"))}`;
+    } else hint.classList.add("hidden");
+  }
+
+  const body = $("#logBody");
+  if (body) body.innerHTML = `<tr><td colspan="9" class="px-4 py-8 text-center" style="color:var(--fg-subtle)">加载中...</td></tr>`;
+  let d;
+  try {
+    const r = await api("/api/logs?" + qs);
+    const { ok, data } = await safeJson(r);
+    if (!ok) {
+      if (body) body.innerHTML = `<tr><td colspan="9" class="px-4 py-8 text-center text-red-500">加载失败：${esc(data.detail || "")}</td></tr>`;
+      return;
+    }
+    d = data;
+  } catch (e) {
+    if (body) body.innerHTML = `<tr><td colspan="9" class="px-4 py-8 text-center text-red-500">加载异常：${esc(String(e && e.message || e))}</td></tr>`;
+    return;
+  }
+  fillLogDatalists();
+
+  const fast = $("#logFastMode") ? $("#logFastMode").checked : false;
+  const total = d.total;              // null = 本次未统计
+  const totalPages = total != null
+    ? Math.max(1, Math.ceil(total / _logPageSize))
+    : (d.has_more ? _logPage + 1 : _logPage);
+  // 游标推进：本页最后一条的 id 就是下一页的起点
+  if (fast && d.next_before_id) _logBeforeId = d.next_before_id;
+
+  $("#logBody").innerHTML = (d.items||[]).map(logRow).join("") ||
+    `<tr><td colspan="9"><div class="empty">${
+      conds.length ? "当前筛选条件下没有记录，试试放宽时间范围或清除筛选" : "还没有请求记录（代理产生调用后这里会出现）"
+    }</div></td></tr>`;
+
+  $("#logPager").innerHTML = total != null
+    ? pagerHtml(total, _logPage, totalPages, "loadLogs")
+    : `<span>${fast ? "快速翻页模式（未统计总数）· " : ""}第 ${_logPage} 页${
+        d.has_more ? "" : " · 已到末尾"}</span>
+       <span class="flex gap-1">
+         <button class="pg-btn px-2 py-1 rounded border text-xs ${_logPage<=1?'opacity-40 pointer-events-none':''} hover:bg-slate-50" onclick="loadLogs(${_logPage-1})"><i class="fa-solid fa-chevron-left"></i></button>
+         <button class="pg-btn px-2 py-1 rounded border text-xs ${d.has_more?'':'opacity-40 pointer-events-none'} hover:bg-slate-50" onclick="loadLogs(${_logPage+1})"><i class="fa-solid fa-chevron-right"></i></button>
+       </span>`;
+}
+
+/** 单条日志行（抽出来便于与汇总区共用配色）。 */
+function logRow(l) {
+  const tokenHtml = (l.prompt_tokens!=null || l.completion_tokens!=null)
+    ? `<div class="leading-tight text-[11px] tnum">
+         <div><i class="fa-solid fa-arrow-down text-emerald-500 text-[10px]"></i> ${fmtK(l.prompt_tokens||0)}
+              <i class="fa-solid fa-arrow-up text-amber-500 text-[10px] ml-1"></i> ${fmtK(l.completion_tokens||0)}</div>
+         <div style="color:var(--fg-subtle)"><i class="fa-solid fa-memory text-[9px] mr-0.5"></i> ${fmtK(l.cached_tokens||0)}</div>
+       </div>`
+    : `<span class="text-xs" style="color:var(--fg-subtle)">—</span>`;
+  const credHtml = l.credits>0
+    ? `<span class="text-emerald-600 font-semibold tnum">${Number(l.credits).toFixed(4)}</span>`
+    : `<span style="color:var(--fg-subtle)">—</span>`;
+  const ttfbColor = ms => ms==null ? 'var(--fg-subtle)' : ms<=3000 ? 'var(--ok)' : ms<=8000 ? '#d97706' : ms<=20000 ? 'var(--warn)' : 'var(--danger)';
+  const totalColor = ms => ms==null ? 'var(--fg-subtle)' : ms<=15000 ? 'var(--ok)' : ms<=30000 ? '#d97706' : ms<=60000 ? 'var(--warn)' : 'var(--danger)';
+  const latencyBar = ms => ms==null ? 0 : Math.min(100, Math.max(4, Math.log10(ms/100+1)*22)).toFixed(1);
+  const latS = l.latency_ms!=null ? (l.latency_ms/1000).toFixed(2)+'s' : '—';
+  const ttfbS = l.ttfb_ms!=null ? (l.ttfb_ms/1000).toFixed(2)+'s' : '—';
+  const latencyHtml = l.ttfb_ms!=null || l.latency_ms!=null
+    ? `<div class="leading-tight text-[11px] tnum">
+         <div class="flex items-center gap-1"><span class="w-7" style="color:var(--fg-subtle)">首字</span><span class="font-medium" style="color:${ttfbColor(l.ttfb_ms)}">${ttfbS}</span></div>
+         <div class="flex items-center gap-1 mt-0.5"><span class="w-7" style="color:var(--fg-subtle)">总</span>
+           <div class="pkg-track" style="width:48px;margin:0"><i style="width:${latencyBar(l.latency_ms)}%;background:${totalColor(l.latency_ms)}"></i></div>
+           <span class="font-medium" style="color:${totalColor(l.latency_ms)}">${latS}</span></div>
+       </div>`
+    : `<span class="text-xs" style="color:var(--fg-subtle)">—</span>`;
+  const ok = !l.error_kind || l.error_kind === 'success';
+  const statusHtml = ok
+    ? `<span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-emerald-100 text-emerald-600 text-xs" title="成功"><i class="fa-solid fa-check"></i></span>`
+    : `<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700" title="${esc(l.error_kind||'')}">${esc((l.error_kind||'失败').slice(0,6))}</span>`;
+  return `<tr title="IP: ${esc(l.client_ip||'—')} | Seq: ${l.seq||'—'}">
+    <td class="text-xs whitespace-nowrap tnum" style="color:var(--fg-subtle)">${fmtTime(l.created_at)}</td>
+    <td class="text-xs font-mono" title="${esc(l.key_name)}">${esc((l.key_name||'').slice(0,10))}</td>
+    <td class="text-xs" title="${esc(l.account_name)}">${esc((l.account_name||'').slice(0,14))}</td>
+    <td class="font-mono text-[11px] whitespace-nowrap" title="${esc(l.model)}">${esc((l.model||'').slice(0,24))}</td>
+    <td>${tokenHtml}</td>
+    <td class="text-xs text-right">${credHtml}</td>
+    <td>${latencyHtml}</td>
+    <td class="text-xs" style="color:var(--fg-muted)" title="透传给上游的 X-Agent-Purpose">${esc((l.use_case||'—').slice(0,14))}</td>
+    <td>${statusHtml}</td>
+  </tr>`;
+}
+
+/** 按账号汇总表：回答「这个号用了多少」，不用翻几十页去数。 */
+async function loadLogSummary() {
+  const box = $("#logSummary");
+  const hint = $("#logSummaryHint");
+  if (!box) return;
+  const days = parseInt(uiSelectValue("logDaysSel") || "1", 10) || 1;
+  const accountId = uiSelectValue("logAccountSel") || "";
+  box.innerHTML = `<div class="fs-12 py-3" style="color:var(--fg-subtle)">加载中...</div>`;
+  try {
+    const r = await api(`/api/logs/summary?days=${days}` + (accountId ? `&account_id=${accountId}` : ""));
+    const { ok, data } = await safeJson(r);
+    if (!ok) { box.innerHTML = `<div class="empty">加载失败：${esc(data.detail || "")}</div>`; return; }
+    const items = data.items || [];
+    if (hint) hint.textContent = `近 ${data.range_days} 天 · ${items.length} 个账号 · 合计 ${fmtCredit(data.total_credits)} 积分`;
+    if (!items.length) { box.innerHTML = `<div class="empty">该时间范围内没有账号产生请求。</div>`; return; }
+    const maxC = Math.max(1, ...items.map(x => x.credits));
+    box.innerHTML = `<table class="tbl" style="min-width:820px">
+      <thead><tr>
+        <th>账号</th><th class="text-right">请求数</th><th class="text-right">失败</th>
+        <th class="text-right">积分</th><th class="text-right">Token</th>
+        <th class="text-right">平均耗时</th><th>最近使用</th><th style="width:120px">积分占比</th>
+      </tr></thead><tbody>${items.map(x => `
+        <tr>
+          <td class="font-medium">${esc(x.account_name)}</td>
+          <td class="text-right tnum">${fmtNum(x.requests)}</td>
+          <td class="text-right tnum" style="color:${x.failed_requests > 0 ? 'var(--danger)' : 'var(--fg-subtle)'}">${x.failed_requests}</td>
+          <td class="text-right tnum font-medium" style="color:var(--warn)">${fmtCredit(x.credits)}</td>
+          <td class="text-right tnum" style="color:var(--fg-muted)">${fmtK(x.total_tokens)}</td>
+          <td class="text-right tnum" style="color:var(--fg-muted)">${x.avg_latency_ms ? (x.avg_latency_ms/1000).toFixed(2)+'s' : '—'}</td>
+          <td class="text-xs" style="color:var(--fg-subtle)">${fmtTime(x.last_used_at, false)}</td>
+          <td><div class="pkg-track" style="margin:0"><i style="width:${Math.max(2, x.credits/maxC*100)}%"></i></div></td>
+        </tr>`).join("")}</tbody></table>`;
+  } catch (e) {
+    box.innerHTML = `<div class="empty">加载异常：${esc(String(e && e.message || e))}</div>`;
+  }
+}
+
+function resetLogFilters() {
+  uiSelectSet("logAccountSel", "");
+  uiSelectSet("logDaysSel", "1");
+  ["logModel", "logKey", "logIp", "logStart", "logEnd"].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = "";
+  });
+  const f = $("#logFastMode"); if (f) f.checked = false;
+  _logBeforeId = null;
+  loadLogAccounts().then(() => { loadLogSummary(); loadLogs(1); });
+}
+
+/** 进入日志面板时的入口（三个请求并行，避免串行等待）。 */
+function openLogsPanel() {
+  _logBeforeId = null;
+  Promise.all([loadLogAccounts(), loadLogSummary()]).then(() => loadLogs(1));
+}
+
 function fillLogDatalists(){
   const set = (id, arr) => {
     const dl = document.getElementById(id);
@@ -3287,21 +4775,24 @@ function fillLogDatalists(){
   };
   set("logModelList", _modelData.map(m => m.model_id).filter(Boolean));
   set("logKeyList", _keyData.map(k => k.name).filter(Boolean));
-  set("logAccList", _accData.map(a => (a.name || a.uid || "")).filter(Boolean));
 }
+
 async function exportLogs(){
+  const days = parseInt(uiSelectValue("logDaysSel") || "1", 10) || 0;
+  const accountId = uiSelectValue("logAccountSel") || "";
   const model = ($("#logModel") ? $("#logModel").value : "").trim();
   const key = ($("#logKey") ? $("#logKey").value : "").trim();
-  const account = ($("#logAccount") ? $("#logAccount").value : "").trim();
   const ip = ($("#logIp") ? $("#logIp").value : "").trim();
   const start = ($("#logStart") ? $("#logStart").value : "").trim();
   const end = ($("#logEnd") ? $("#logEnd").value : "").trim();
   const params = [];
+  if(accountId) params.push("account_id=" + encodeURIComponent(accountId));
   if(model) params.push("model=" + encodeURIComponent(model));
   if(key) params.push("key=" + encodeURIComponent(key));
-  if(account) params.push("account=" + encodeURIComponent(account));
   if(ip) params.push("client_ip=" + encodeURIComponent(ip));
   if(start) params.push("start=" + encodeURIComponent(start + " 00:00:00"));
+  else if(days > 0) params.push("start=" + encodeURIComponent(
+    new Date(Date.now() - days*86400000).toISOString().slice(0,19).replace("T"," ")));
   if(end) params.push("end=" + encodeURIComponent(end + " 23:59:59"));
   const qs = params.length ? ("?" + params.join("&")) : "";
   toast("正在导出 CSV...", "ok");
@@ -3484,7 +4975,10 @@ function fmtNum(n) {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
   return String(Math.round(n));
 }
-function fmtCredit(n) { return (Number(n) || 0).toFixed(2); }
+/* 注意：`fmtCredit` 定义在上面（组件区），**不要在这里再定义一次** ——
+ * 之前这里有一份 `return n.toFixed(2)` 的重复实现，因为声明在后，
+ * 直接把上面那版覆盖掉，于是「积分不保留小数」的改动完全没生效。
+ * 函数声明会提升，同名后者胜出，属于最难察觉的一类覆盖。 */
 
 /* 纯 SVG 环形图 + 图例表格（不引第三方图表库，保持单文件零依赖）
  * tooltip：原生 <title> 有 ~1s 延迟且样式不可控，故自绘跟随鼠标的浮层。
