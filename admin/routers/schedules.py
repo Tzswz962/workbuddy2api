@@ -13,10 +13,11 @@ from admin.security import require_admin
 
 router = APIRouter(prefix="/api/schedules", tags=["schedules"])
 
-TASK_CHOICES = ["refresh_balances", "sync_models", "daily_checkin",
-                "refresh_growth_tasks", "run_growth_tasks"]
+TASK_CHOICES = ["refresh_balances", "refresh_credits", "sync_models", "daily_checkin",
+                "refresh_growth_tasks", "run_growth_tasks", "keepalive_tokens"]
 TASK_LABELS = {
     "refresh_balances": "刷新平台总积分",
+    "refresh_credits": "更新积分到期快照",
     "sync_models": "同步模型列表",
     "daily_checkin": "每日签到领取积分",
     "refresh_growth_tasks": "每日更新成长任务列表",

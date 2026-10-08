@@ -86,23 +86,95 @@ _PRINT_LOCK = threading.Lock()
 
 
 def _log(msg: str) -> None:
+    """安全打印：绝不因为控制台编码问题把整个监督进程搞崩。
+
+    真实事故：Windows 控制台默认 GBK，`print("❌ ...")` 抛
+    `UnicodeEncodeError: 'gbk' codec can't encode character '\\u274c'`。
+    而 `_log` 是**监督进程**用来报告「子进程已退出」的关键路径 ——
+    它一崩，父进程直接退出，uvicorn 子进程变成孤儿：
+    端口还在监听，但已经没人管它，表现为**服务无响应且日志不再增长**，
+    排查时极难看出真正原因（报错只写在 stderr 里）。
+
+    所以这里显式按 UTF-8 写 stdout，失败再退到「替换不可编码字符」，
+    保证日志功能永远不会反过来杀死进程。
+    """
     with _PRINT_LOCK:
-        print(msg, flush=True)
+        try:
+            print(msg, flush=True)
+        except UnicodeEncodeError:
+            # 退路 1：按 UTF-8 直接写底层 buffer（绕过控制台编码）
+            try:
+                buf = getattr(sys.stdout, "buffer", None)
+                if buf is not None:
+                    buf.write((msg + "\n").encode("utf-8", "replace"))
+                    buf.flush()
+                    return
+            except Exception:
+                pass
+            # 退路 2：替换掉编不了的字符，至少把信息打出来
+            try:
+                enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                print(msg.encode(enc, "replace").decode(enc, "replace"), flush=True)
+            except Exception:
+                pass
 
 
 def _pump(stream, log_path: Path, tag: str) -> None:
-    """把子进程输出实时打到控制台并写入日志文件（类 tee，文本模式）。"""
+    """把子进程输出实时打到控制台并写入日志文件（类 tee，文本模式）。
+
+    ⚠️ **这个函数一旦停止读取，整个服务就会「僵死」** —— 必须永不退出。
+
+    原理：子进程的 stdout 是一根**管道**（PIPE）。管道缓冲区满了以后，
+    子进程再写就会**阻塞在 write 上**；而 uvicorn 的 access log 是在
+    事件循环里打的，于是「打日志」这一步把事件循环冻住：
+    端口还在监听、进程 CPU 归零、**任何请求（连 404 路由）都不再返回**。
+    实测就是这样：`admin.log` 停在某一刻不再增长，全站随后无响应。
+
+    原实现把整个 `for` 循环包在一个 `try/except: pass` 里 —— 只要写入
+    控制台或日志文件抛一次异常（最典型是 Windows GBK 控制台遇到中文/emoji
+    的 `UnicodeEncodeError`），**读取线程直接结束**，管道再没人排空，
+    子进程随即卡死。而 `pass` 让这件事连一行痕迹都没留下。
+
+    现在的做法：读循环绝不因为「写失败」而退出 —— 写不进去就丢弃该行，
+    继续排空管道。宁可丢日志，也不能让服务僵死。
+    """
+    lf = None
     try:
-        with open(log_path, "a", encoding="utf-8") as lf:
-            for raw in iter(stream.readline, ""):
-                if not raw:
-                    break
-                text = raw.rstrip("\n")
-                _log(f"[{tag}] {text}")
-                lf.write(raw)
-                lf.flush()
+        lf = open(log_path, "a", encoding="utf-8")
     except Exception:
-        pass
+        lf = None
+    try:
+        for raw in iter(stream.readline, ""):
+            if not raw:
+                break
+            # 1) 控制台回显：失败不算事，接着读
+            try:
+                _log(f"[{tag}] {raw.rstrip()}")
+            except Exception:
+                pass
+            # 2) 落盘：失败也不算事，接着读
+            if lf is not None:
+                try:
+                    lf.write(raw)
+                    lf.flush()
+                except Exception:
+                    try:
+                        lf.close()
+                    except Exception:
+                        pass
+                    lf = None       # 之后只排空管道，不再尝试写盘
+    finally:
+        # 无论如何都要把管道读到 EOF：这是保证子进程不被写阻塞的最后一道保险。
+        try:
+            for _ in iter(stream.readline, ""):
+                pass
+        except Exception:
+            pass
+        if lf is not None:
+            try:
+                lf.close()
+            except Exception:
+                pass
 
 
 # 运行后台所需的核心依赖；当前解释器缺任一即尝试切换到带依赖的虚拟环境。
@@ -692,19 +764,44 @@ def main() -> None:
         _log("    请在 .env 中设置这两项后重启（已不再提供 admin/admin123 默认口令）。")
 
     procs: list[tuple[str, subprocess.Popen]] = []
+    # 子进程日志文件句柄：必须持有引用，否则被 GC 回收会把子进程的 stdout 关掉
+    _logfiles: list = []
     stop = threading.Event()
 
     def _launch(tag: str, cmd: list[str], port: int, host: str, logfile: Path) -> None:
         _log(f"[main] 启动 {tag} (http://{host}:{port}) : {' '.join(cmd)}")
-        p = subprocess.Popen(
-            cmd, cwd=str(ROOT),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            # 独立进程组：停止时能连同子进程一起收掉，不会留下占着端口的孤儿。
-            start_new_session=True,
-            text=True, bufsize=1, env=os.environ.copy(),
-        )
+        # 交互式终端才用「管道 + 转发线程」以便边跑边看；
+        # **后台/服务方式则让子进程直接写日志文件**。
+        #
+        # 为什么：管道是有容量上限的，必须有人持续排空。而「没人排空」的后果
+        # 不是丢日志，是**子进程卡死在 write 上**（uvicorn 打 access log 时
+        # 冻结事件循环 → 全站无响应）。服务方式下没人看控制台，
+        # 用管道换取回显并不值得冒这个风险：直接重定向到文件即可，
+        # 文件写入永远不会因为「没有读者」而阻塞。
+        interactive = False
+        try:
+            interactive = bool(sys.stdout) and sys.stdout.isatty()
+        except Exception:
+            interactive = False
+        if interactive:
+            p = subprocess.Popen(
+                cmd, cwd=str(ROOT),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                start_new_session=True,
+                text=True, bufsize=1, env=os.environ.copy(),
+            )
+            threading.Thread(target=_pump, args=(p.stdout, logfile, tag),
+                             daemon=True).start()
+        else:
+            fh = open(logfile, "a", encoding="utf-8", errors="replace")
+            _logfiles.append(fh)        # 持有引用，避免被 GC 关掉
+            p = subprocess.Popen(
+                cmd, cwd=str(ROOT),
+                stdout=fh, stderr=subprocess.STDOUT,
+                start_new_session=True,
+                text=True, bufsize=1, env=os.environ.copy(),
+            )
         procs.append((tag, p))
-        threading.Thread(target=_pump, args=(p.stdout, logfile, tag), daemon=True).start()
 
     _launch("admin", *_build_admin_cmd(args), LOGS / "admin.log")
 

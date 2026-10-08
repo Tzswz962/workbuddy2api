@@ -578,6 +578,10 @@ _RETRYABLE_KINDS = frozenset({
 #: 要放开应当做「只换到**不同 domain** 的账号」的定向轮转，而不是无脑 continue。
 _MODEL_SWITCH_KINDS = frozenset({"model_block"})
 
+#: `/v1/models` 的最大换号次数。刻意小于 MAX_ROTATE：
+#: 列模型只是元数据，不值得让客户端等几分钟；上游卡住时早报错更有用。
+_MODELS_MAX_TRY = 3
+
 #: 提交前探测缓冲上限：超过它就直接转发，避免为了等错误而无限期憋住正常流。
 _INBAND_PROBE_MAX = 64 * 1024
 
@@ -699,6 +703,57 @@ def _sse_has_error_event(body: str) -> bool:
     return False
 
 
+#: 匹配**非空**的 finish_reason 值。
+#: 只认带引号的值：流式分片里 ``"finish_reason": null`` 是常态，
+#: 用这个正则天然把它排除（null 不带引号）。
+_FINISH_REASON_RE = re.compile(r'"finish_reason"\s*:\s*"([^"]*)"')
+
+
+def _sse_has_finish_reason(body: str) -> bool:
+    """SSE 里是否出现过**非空** finish_reason（流式协议的正常收尾标志）。"""
+    for m in _FINISH_REASON_RE.finditer(body or ""):
+        if (m.group(1) or "").strip():
+            return True
+    return False
+
+
+def _sse_is_truncated(body: str) -> bool:
+    """流是否**被截断**：有内容，却没有任何终止标志。
+
+    OpenAI 流式协议要求以 ``finish_reason`` 收尾（实践中还会补一个
+    ``data: [DONE]``）。上游偶尔会直接断掉连接，两者都没有 ——
+    客户端于是报「Stream ended without finish_reason」并**反复重试**。
+
+    这一类响应必须单独识别出来：
+      * 不能记成 success（否则坏号永不受罚，客户端每次重试都再命中它）；
+      * 若尚未把字节发给客户端，应换号重试；
+      * 若已发出，至少要补一个终止帧，让客户端正常收尾而不是报错重试。
+    """
+    if not body:
+        return False
+    return not _sse_has_finish_reason(body) and "[DONE]" not in body
+
+
+def _sse_terminal_stub(model: str) -> str:
+    """补一个最小可用的终止帧（``finish_reason=stop`` + ``data: [DONE]``）。
+
+    用在「内容已经发给客户端、但上游没给终止帧」的场合：改不了已发出的字节，
+    但可以让客户端**正常结束**这次流式读取，而不是判定失败并重试。
+
+    这里如实发 ``stop`` 而不是伪装成 ``tool_calls``：截断时无法知道本该是什么，
+    发 ``stop`` 语义最中性，也不会诱导客户端去执行一个不完整的工具调用。
+    """
+    chunk = {
+        "id": "chatcmpl-gateway-truncated",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model or "",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+    return ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
+            "data: [DONE]\n\n")
+
+
 #: 各种协议里「真实正文增量」的字段名。只有看到其中之一，才认为这条流是健康的。
 _CONTENT_FIELDS = ("content", "reasoning_content", "text", "thinking", "tool_calls")
 
@@ -789,6 +844,27 @@ def _exhaustion_message(kind: str, last_msg: str, tried_accounts: int,
         # 只取前 120 字符，避免把上游内部细节整段抛出去。
         return f"{base}。底层原因：{last_msg[:120]}"
     return f"{base}。请稍后重试，或联系管理员查看网关日志。"
+
+
+def _extract_http_status(msg: str) -> int:
+    """从异常文本里抠出 HTTP 状态码；抠不到返回 0。
+
+    为什么需要：分类器 `_classify_error(status, body)` 靠 **status** 判断
+    401/403（权威的登录态失效）。但 `backend.py` 抛出的异常只有一句话：
+
+        RuntimeError: 后端返回非 JSON GET /v2/... HTTP 401: <html>...
+
+    调用方（保活、非流式路径）拿不到 status 对象，只能把它当 0 传进去 ——
+    于是 401 被归成 `transport`（网络抖动），既不禁用也不计数。
+    这正是「7 个号失效了保活却报全好」的最后一环。
+
+    这里把文本里的状态码抠出来，让分类器能按真实语义判定。
+    """
+    m = re.search(r"\bHTTP[/ ]?(\d{3})\b", msg or "")
+    if m:
+        return int(m.group(1))
+    m = re.search(r"\b(4\d{2}|5\d{2})\b", msg or "")
+    return int(m.group(1)) if m else 0
 
 
 def _classify_error(status: int, body: str) -> str:
@@ -1049,17 +1125,35 @@ def _apply_account_policy(db: Session, acc: Account, kind: str, status: int,
         acc.last_err_at = now
         acc.last_err_msg = (msg or "account fault")[:255]
     elif kind == "session_dead":
-        # 连续计数：12153 在真实环境会被临时性触发（上游抖动 / 并发刷新 token），
-        # 一次就禁用等于误杀一个健康号。达阈值才禁用。
+        # 区分两种「登录态失效」，它们的确定性完全不同：
+        #
+        #   * **HTTP 401 / 403** —— 上游**明确拒绝**了这个 token。
+        #     这是权威判定，不是抖动：token 被吊销/被换掉就是彻底不可用了，
+        #     重试一万次还是 401。必须**立即禁用**，否则这个号会一直留在池子里
+        #     被反复选中（实测就是这样：7 个号的 status 一直是 active，
+        #     每次取模型/对话都先命中它们再失败）。
+        #
+        #   * **12153 / "session not found" 文案** —— 真实环境会被临时性触发
+        #     （上游抖动 / 并发刷新 token），一次就禁用等于误杀健康号。
+        #     所以保留「连续计数达阈值才禁用」。
+        #
+        # 原实现把两者混为一谈（只看文案），于是确定性的 401 也被当成抖动，
+        # 要等 3 次才禁用 —— 期间每次请求都在白烧一次轮转。
+        authoritative = status in (401, 403)
         acc.session_dead_fails = (acc.session_dead_fails or 0) + 1
         acc.cool_kind = "session_dead"
         acc.last_err_at = now
         acc.last_err_msg = (msg or "session dead")[:255]
-        if acc.session_dead_fails >= max(1, settings.SESSION_DEAD_THRESHOLD):
+        threshold = 1 if authoritative else max(1, settings.SESSION_DEAD_THRESHOLD)
+        if acc.session_dead_fails >= threshold:
             acc.status = "disabled"
             acc.cool_until = None
             acc.breaker_until = None
             acc.degrade_until = None
+            if authoritative:
+                acc.last_err_msg = (
+                    f"登录态被上游拒绝（HTTP {status}），需重新登录：{(msg or '')[:180]}"
+                )[:255]
     elif kind == "waf":
         # WAF 403：短冷却 + IP 级判定。多账号同时命中说明是**出口 IP** 被拦，
         # 此时继续轮转只会把一次请求放大成 N 次（加重风控）。
@@ -1388,19 +1482,68 @@ def _no_account_reason(db: Session) -> str:
             f"（其中 {blocked} 个处于熔断/降权或需人工处理的异常状态）")
 
 
+#: last_err_msg 里代表「上游明确拒绝了这个登录态」的标记。
+#: 与 `_SESSION_DEAD_MARKERS`（文案式、可能是抖动）**刻意分开**：
+#: 这里只认 HTTP 401/403 这类**权威**判定，或保活探测写下的明确结论。
+_LOGIN_DEAD_MARKERS = (
+    "需重新登录",                 # 保活探测 / 策略写入的结论
+    "登录态被上游拒绝",
+    "401 authorization required",
+    "http 401",
+    "http 403",
+)
+
+
+def _looks_login_dead(acc: Account, now: datetime) -> bool:
+    """该账号是否已被**确证**登录态失效（应从选号中排除）。
+
+    为什么不能只看 `status`：失效判定依赖连续计数达阈值，
+    而阈值存在「还没到禁用、但已经确定不能用」的窗口期。
+    在这个窗口里，账号仍是 active、有余额、无冷却 —— 每次选号都会命中它，
+    每次请求都白失败一次（实测 7 个号正是这样）。
+
+    为什么也不看 `session_dead_fails > 0`：那个计数在旧实现里
+    会把网络抖动（transport）一起算进去，拿它当门控会误杀健康号。
+    所以只认**权威标记**——由 401/403 路径或保活探测写下的那句结论。
+    """
+    # 用 getattr 容错：调用方（测试替身、其它模块传入的轻量对象）未必带齐字段，
+    # 缺字段时按「健康」处理 —— 门控是**额外的排除条件**，不该因为缺字段
+    # 把候选全部排掉（那会让选号直接返回 None，比漏过一个坏号更严重）。
+    if (getattr(acc, "status", "active") or "active") != "active":
+        return True                      # 已禁用/停用，本就不该被选
+    msg = (getattr(acc, "last_err_msg", "") or "").lower()
+    if not msg:
+        return False
+    return any(m in msg for m in _LOGIN_DEAD_MARKERS)
+
+
 def _select_account(db: Session, exclude_ids: set | None = None,
                     min_balance: int = 1, mark_picked: bool = True,
                     model: str = "", sticky_key: str = "",
                     require_realm: str = "") -> Account | None:
     """从健康账号池中挑选一个账号。
 
-    选号 = 会话粘性（命中即定）→ 健康过滤 → 加权/择优（软均衡）三层串联。
+    选号 = 会话粘性（命中即定）→ 健康过滤 → **到期紧迫度（硬优先）** →
+    同级内按策略微调，四层串联。
 
     健康条件：active、有余额、不在**任一**冷却/熔断/降权期内、不在 exclude_ids 中、
     该账号对该 model 没有处于模型级冷却（6004/11102）、在途未占满。
 
-    选号策略（`ADMIN_ACCOUNT_SELECT`）：
-      * `oldest`   最老录入优先（**默认**）—— 先用完老账号额度，避免积分过期作废
+    **到期紧迫度是第一优先级（所有策略共用）**：
+      0) 有 7 天内到期的剩余额度   —— 必须先用完，否则整包作废
+      1) 有过期时间但还早         —— 到期越早越先（自然先烧离到期近的）
+      2) 全部长期有效             —— 没有作废风险，只做兜底
+    只有在同一紧迫度级别内部，才按 `ADMIN_ACCOUNT_SELECT` 的策略决定先后。
+
+    为什么要把紧迫度提成硬优先而不是只当权重：权重是概率倾斜，池子里只要还有
+    余额更高/更闲置的号，抽签就可能一直不选那个快过期的号，直到额度作废。
+    用户要的是「优先把快到期的账号积分先用完」—— 那是**严格优先**，不是倾向。
+    参考实现（workbuddy-switch rotates.rs 的 urgency_key）也是同一形态：
+    先按 (是否有到期, 最早到期时间) 排序取最紧迫者，余额只作可选的补充过滤。
+
+    策略（`ADMIN_ACCOUNT_SELECT`，仅在紧迫度同级内生效）：
+      * `expiring` 到期最近优先（**默认**）—— 严格「先用快过期的」
+      * `oldest`   最老录入优先 —— 到期数据缺失时的次优选择
       * `remain`   余额最多优先（确定性）
       * `lru`      最久未用优先（确定性）
       * `weighted` 三因子加权随机（余额占比 ×10 + 快过期积分占比 ×8 + 闲置补偿），
@@ -1437,6 +1580,20 @@ def _select_account(db: Session, exclude_ids: set | None = None,
     if not rows:
         return None
 
+    # 「已知登录态失效」的号直接排除 —— 这是本次故障的直接补丁。
+    #
+    # 背景：`last_err_msg` 里已经是 401 的号，如果只是被计了 1 次
+    # session_dead_fails（还没到禁用阈值），它仍然满足 active + 有余额 + 无冷却，
+    # 于是每次选号都会命中它、每次请求都白失败一次。
+    # 权威判定（HTTP 401/403）现在会立即禁用，但历史遗留数据里可能还有
+    # 只计过数、没禁用的号，所以选号层再兜一道。
+    #
+    # 判据取「权威 401 标记」而不是「计数 > 0」：计数会被网络抖动误加
+    # （旧实现就把它和 transport 混在一起），拿它当门控会误杀健康号。
+    rows = [a for a in rows if not _looks_login_dead(a, now)]
+    if not rows:
+        return None
+
     # 模型级冷却过滤（6004 / 11102）：只排除「该账号×该模型」，
     # 账号对其他模型仍然可用 —— 这正是模型级冷却独立存在的意义。
     if model:
@@ -1469,42 +1626,70 @@ def _select_account(db: Session, exclude_ids: set | None = None,
     pool_rows = fresh or rows  # 全被刚用过时兜底放行
     POOL.recent.prune()
 
-    # -- 第三层：按策略选择 ----------------------------------------------
+    # -- 第三层：到期紧迫度（硬优先，所有策略共用）------------------------
+    #
+    # 先切出「最紧迫的那一档」，后续策略只在这一档里挑。这样即使策略配成
+    # weighted（概率型），也不会漏掉任何一个 7 天内到期的号。
+    best_rank = min(pool.expiry_key(a, now)[0] for a in pool_rows)
+    urgent = [a for a in pool_rows if pool.expiry_key(a, now)[0] == best_rank]
+
+    # -- 第四层：按策略在同紧迫度档位内选择 --------------------------------
     acc: Account | None = None
-    if settings.ACCOUNT_SELECT == "oldest":
-        # 最老录入优先：**先用完老账号的额度**。
+    strategy = settings.ACCOUNT_SELECT
+    if strategy == "weighted":
+        canon = [
+            {"uid": a.uid or "", "credits": int(a.balance_remain or 0),
+             "credits_expiring": int(a.credits_expiring_soon or 0)
+                                 or int(a.credits_expiring or 0),
+             "expiry_rank": pool.expiry_key(a, now),
+             "last_used_at": a.last_used_at, "acc": a}
+            for a in urgent
+        ]
+        picked = pool.weighted_pick(canon, now=now)
+        acc = picked["acc"] if picked else None
+    elif strategy == "remain":
+        # 余额最多优先。
+        # 在 Python 侧排序是因为上面已做过内存过滤（在途占满 / 模型级冷却），
+        # 再回数据库 order_by 会丢掉这些过滤结果。
+        urgent.sort(key=lambda a: int(a.balance_remain or 0), reverse=True)
+        acc = urgent[0]
+    elif strategy == "lru":
+        # 最久未用优先：从未用过的（None）排最前，让新号/闲置号先被使用。
+        urgent.sort(key=lambda a: a.last_used_at or datetime.min)
+        acc = urgent[0]
+    elif strategy == "oldest":
+        # 最老录入优先（**仅在同一个到期紧迫度档位内**）。
         #
-        # 为什么这是对的：官方赠送/任务获得的积分**会过期作废**，
-        # 老账号攒的积分离到期最近 —— 如果一直从新号开始用，
-        # 老号的积分就会白白过期（用户原话：「积分都快过期了为啥不先用」）。
+        # 注意语义变化：`oldest` 曾经是「全局第一优先级」，靠「老号离到期近」
+        # 这个**代理指标**来近似「先用快过期的」。现在到期信息已经能直接读到
+        # （credits_soonest_expire_at），代理指标就没有必要再凌驾于真实数据之上 ——
+        # 否则一个 7 天后作废的新号会被一个 200 天后到期的老号压住，
+        # 恰好做成了我们要避免的事。
         #
-        # 次级键用 last_used_at 升序（最久未用的先走），
-        # 避免同一个老号被连续打满；再兜底按 id 升序保证顺序稳定。
-        pool_rows.sort(key=lambda a: (
+        # 所以这里保留 `oldest` 的原始语义，但降为档位内的排序键：
+        # 同级（比如都是「长期有效」）时，仍然按录入时间从老到新。
+        urgent.sort(key=lambda a: (
             a.created_at or datetime.min,
             a.last_used_at or datetime.min,
             a.id,
         ))
-        acc = pool_rows[0]
-    elif settings.ACCOUNT_SELECT == "weighted":
-        canon = [
-            {"uid": a.uid or "", "credits": int(a.balance_remain or 0),
-             "credits_expiring": int(a.credits_expiring or 0),
-             "last_used_at": a.last_used_at, "acc": a}
-            for a in pool_rows
-        ]
-        picked = pool.weighted_pick(canon, now=now)
-        acc = picked["acc"] if picked else None
-    elif settings.ACCOUNT_SELECT == "lru":
-        # 最久未用优先：从未用过的（None）排最前，让新号/闲置号先被使用。
-        pool_rows.sort(key=lambda a: a.last_used_at or datetime.min)
-        acc = pool_rows[0]
+        acc = urgent[0]
     else:
-        # remain：余额最多优先。
-        # 在 Python 侧排序是因为上面已做过内存过滤（在途占满 / 模型级冷却），
-        # 再回数据库 order_by 会丢掉这些过滤结果。reverse=True 配正数 key。
-        pool_rows.sort(key=lambda a: int(a.balance_remain or 0), reverse=True)
-        acc = pool_rows[0]
+        # expiring（默认）：档位内按**真实到期时间**升序。
+        #
+        #   1. 最早到期时间（离到期近的先走）—— 这是 expiring 的核心，
+        #      也是「先用快过期的」最直接的实现
+        #   2. 最久未用（避免同一个号被连续打满）
+        #   3. id 升序（顺序稳定，便于复现）
+        #
+        # 长期有效的号 credits_soonest_expire_at 为 None → 用 datetime.max
+        # 排到最后，符合「没有作废风险，留到最后用」。
+        urgent.sort(key=lambda a: (
+            a.credits_soonest_expire_at or datetime.max,
+            a.last_used_at or datetime.min,
+            a.id,
+        ))
+        acc = urgent[0]
 
     if acc is not None and mark_picked:
         POOL.recent.mark(acc.uid or "")
@@ -2108,6 +2293,32 @@ async def chat_completions(
                             # 聚合模式全程缓冲、尚未向客户端产出任何字节，可整条重试。
                             # 流式模式只在「还没提交过字节」时才可重试。
                             can_retry = aggregate or not committed
+
+                            # 「流被截断」：上游结束了连接，却没有任何终止帧
+                            # （没有 finish_reason、也没有 [DONE]）。客户端会报
+                            # 「Stream ended without finish_reason」并**反复重试**。
+                            # 原实现把它当成功（_note_success）、不惩罚账号，
+                            # 于是每次重试都再选中同一个坏号 —— 正是「一直重试」的成因。
+                            truncated = (not aggregate and not stream_is_error
+                                         and _sse_is_truncated(text))
+                            if truncated and can_retry:
+                                # 一个字节都没发出去 → 完整换号重试，用户无感
+                                kind = "upstream_internal"
+                                _apply_account_policy(db2, acc_i, kind, 200, text[:500], model=m)
+                                _maybe_degrade(db2, acc_i)
+                                sess_i.close()
+                                POOL.release(held_uid)
+                                held_uid = ""
+                                last_err_kind = kind
+                                last_err_msg = "上游流被截断（无 finish_reason 与 [DONE]）"
+                                _logger.warning(
+                                    "上游流被截断且尚未提交，换号重试 acc=%s model=%s body=%.160s",
+                                    final_uid, m, text)
+                                collected.clear()      # 下一轮从零收集，避免拼接两个号的内容
+                                delivered = False
+                                await pool.rotate_backoff_async(rotate_idx)
+                                rotate_idx += 1
+                                continue
                             if stream_is_error:
                                 kind = _classify_error(200, text)
                                 if can_retry:
@@ -2170,6 +2381,31 @@ async def chat_completions(
                                     delivered = True
                                     yield tail if tail else probe
                                     probe = ""
+                            # 已把内容发给客户端、但流被截断：换号已不可能（收不回来），
+                            # 但**绝不能记成成功** —— 否则坏号永不受罚，
+                            # 客户端每次重试都再命中它，就是这个号一直失败的原因。
+                            if truncated:
+                                kind = "upstream_internal"
+                                _apply_account_policy(db2, acc_i, kind, 200, text[:500], model=m)
+                                _maybe_degrade(db2, acc_i)
+                                latency_ms = int((time.perf_counter() - request_start) * 1000)
+                                seq = _log_chat_row(None, latency_ms, final_model, mode,
+                                                    final_uid, 200, None, error_kind=kind)
+                                _record_usage(key.id, final_acc_id, final_model, 0.0, None,
+                                              client_ip=_client_ip(request),
+                                              use_case="chat-completion", seq=seq,
+                                              latency_ms=latency_ms, error_kind=kind)
+                                sess_i.close()
+                                POOL.release(held_uid)
+                                held_uid = ""
+                                _logger.warning(
+                                    "上游流被截断且已提交，补发终止帧 acc=%s model=%s body=%.160s",
+                                    final_uid, m, text)
+                                # 补终止帧：客户端据此正常收尾，不再判失败重试。
+                                # 内容仍是上游已给的部分（截断是上游造成的，
+                                # 但「报错 + 无限重试」对用户更糟）。
+                                yield _sse_terminal_stub(final_model)
+                                return
                             # 确认是健康响应后，才清空连败计数：
                             # 「200 但体内是错误」不该被记成一次成功。
                             acc_i.last_used_at = datetime.utcnow()
@@ -3129,11 +3365,27 @@ async def anthropic_count_tokens(
 
 
 @router.get("/v1/models")
-async def models(
+def models(
     db: Session = Depends(get_db),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     authorization: str | None = Header(default=None),
 ):
+    """列出可用模型（**同步端点，故意的**）。
+
+    ⚠️ 这里必须是 `def` 而**不是** `async def`。
+
+    FastAPI 对 `def` 端点会**自动丢进线程池**执行；而 `async def` 端点的函数体
+    直接在**事件循环**里跑。本函数内部全是**同步阻塞**调用
+    （`AccountSession` / `httpx.Client` / SQLAlchemy），一旦写成 `async def`，
+    每一次上游网络等待都会**冻结整个事件循环** —— 连一个 404 路由都超时，
+    管理后台全站无响应。
+
+    这不是理论风险，是实测事故：加上「换号重试」后最多会串行阻塞
+    6 次 × 单次超时（最长 60s），事件循环可被占住**数分钟**，
+    表现就是「服务在监听、但任何请求都不返回」。
+
+    改成 `def` 后由线程池承载，阻塞再久也只占一个工作线程。
+    """
     api_key = x_api_key
     if not api_key and authorization and authorization.startswith("Bearer "):
         api_key = authorization[7:].strip()
@@ -3154,23 +3406,63 @@ async def models(
                                                "type": "no_account"}})
     # 绑定了分组的 Key 只应看到组内模型，否则客户端会照着完整列表点模型然后被 403
     allowed = _key_group_models(db, key)
-    try:
-        with backend.AccountSession(acc.auth_json) as sess:
-            models_raw = sess.fetch_models()
-            acc.auth_json = sess.updated_json()
-        acc.last_used_at = datetime.utcnow()
-        db.commit()
-        data = [{
-            "id": m.get("id"),
-            "object": "model",
-            "owned_by": "codebuddy",
-            "name": m.get("name") or m.get("id"),
-            "credit_multiplier": backend.CredentialManager._parse_credit_multiplier(m.get("credits"))
-            if hasattr(backend.CredentialManager, "_parse_credit_multiplier") else None,
-        } for m in models_raw
-            if m.get("id")
-            and m.get("id", "").lower() != "auto"
-            and (m.get("id") in allowed if allowed is not None else _is_model_allowed(db, m.get("id")))]
-        return {"object": "list", "data": data, "source": "backend"}
-    except Exception as e:
-        return JSONResponse(status_code=502, content={"error": {"message": f"获取模型失败：{e}", "type": "upstream"}})
+    # 换号重试 + 错误处置，与对话端点同口径。
+    #
+    # 原实现只选**一次**账号，失败就直接 502 —— 既不做 `_apply_account_policy`
+    # （不冷却、不计数、不禁用），也不换号。后果是一个登录态失效的号会
+    # **每次**取模型都命中它：用户看到「模型列表报 502 / 401」而不是自动恢复，
+    # 坏号也永远不会被标记，形成死循环。
+    #
+    # 重试次数**刻意比对话端点更保守**（默认 3，而不是 MAX_ROTATE=6）：
+    # 列模型只是元数据，不值得让客户端等上好几分钟；
+    # 上游网络卡住时，早一点如实报错比长时间无响应更有用。
+    tried_ids: set[int] = set()
+    last_err = ""
+    max_try = max(1, min(settings.MAX_ROTATE, _MODELS_MAX_TRY))
+    for attempt in range(max_try):
+        if acc is None:
+            break
+        try:
+            with backend.AccountSession(acc.auth_json) as sess:
+                models_raw = sess.fetch_models()
+                acc.auth_json = sess.updated_json()
+            acc.last_used_at = datetime.utcnow()
+            # 注意参数顺序是 (db, acc) —— 写反了会把 Session 当账号用，
+            # 报 "'Session' object has no attribute 'breaker_fails'"，而且因为
+            # 在 try 里会被当成「取模型失败」→ 502，很难一眼看出是参数顺序问题。
+            _note_success(db, acc)
+            db.commit()
+            data = [{
+                "id": m.get("id"),
+                "object": "model",
+                "owned_by": "codebuddy",
+                "name": m.get("name") or m.get("id"),
+                "credit_multiplier": backend.CredentialManager._parse_credit_multiplier(m.get("credits"))
+                if hasattr(backend.CredentialManager, "_parse_credit_multiplier") else None,
+            } for m in models_raw
+                if m.get("id")
+                and m.get("id", "").lower() != "auto"
+                and (m.get("id") in allowed if allowed is not None else _is_model_allowed(db, m.get("id")))]
+            return {"object": "list", "data": data, "source": "backend"}
+        except Exception as e:
+            last_err = str(e)
+            # 与对话端点同一套处置：先分类，再按分类冷却/计数/禁用。
+            # 401 → session_dead 连续计数，达阈值自动禁用；
+            # 其余按各自分类（限流冷却、WAF 等）。
+            kind = _classify_error(_extract_http_status(last_err), last_err)
+            try:
+                _apply_account_policy(db, acc, kind, _extract_http_status(last_err), last_err)
+            except Exception:
+                db.rollback()
+            tried_ids.add(acc.id)
+            if attempt + 1 >= max_try:
+                acc = None
+                break
+            # 换一个号再试（排除已失败的）。
+            # 第二次放宽 min_balance：模型列表不消耗积分，
+            # 余额为 0 的号也能正常列模型，不该因此被排除。
+            acc = (_select_account(db, exclude_ids=tried_ids)
+                   or _select_account(db, exclude_ids=tried_ids, min_balance=0))
+    return JSONResponse(status_code=502, content={
+        "error": {"message": f"获取模型失败（已尝试 {len(tried_ids)} 个账号）：{last_err[:200]}",
+                  "type": "upstream"}})

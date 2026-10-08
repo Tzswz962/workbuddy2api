@@ -85,23 +85,74 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
         ok = fail = 0
         failed_names: list[str] = []
         for a in db.query(Account).filter(Account.status == "active").all():
-            # with_expiry=True：顺带统计「快过期积分」。
-            # 这个字段是选号策略（oldest / weighted）的依据 —— 之前一直是 0，
-            # 导致「先用快过期的额度」这条规则实际上从未生效。
+            # with_expiry=True：顺带同步「积分包到期快照」。
+            # 这个快照是选号策略（expiring / weighted）的依据 —— 之前
+            # credits_expiring 长期是 0，导致「先用快过期的额度」这条规则
+            # 实际上从未生效。
             if acc_router._refresh_balance(a, with_expiry=True):
                 ok += 1
             else:
                 fail += 1
                 failed_names.append(_account_label(a))
             db.commit()
-        expiring = sum(int(a.credits_expiring or 0)
-                       for a in db.query(Account).filter(
-                           Account.status == "active").all())
+        rows = db.query(Account).filter(Account.status == "active").all()
+        expiring = sum(int(a.credits_expiring or 0) for a in rows)
+        expiring_soon = sum(int(a.credits_expiring_soon or 0) for a in rows)
         return {"task": task, "ok": True, "refreshed": ok, "failed": fail,
                 "credits_expiring": expiring,
+                "credits_expiring_soon": expiring_soon,
                 "failed_accounts": failed_names[:10],
                 "summary": (f"刷新成功 {ok} 个账号"
-                            + (f"，快过期积分 {expiring}" if expiring else "")
+                            + (f"，7 天内到期积分 {expiring_soon}" if expiring_soon
+                               else (f"，快过期积分 {expiring}" if expiring else ""))
+                            + (f"，{fail} 个失败：{'、'.join(failed_names[:3])}"
+                               if fail else ""))}
+    if task == "refresh_credits":
+        from admin.routers import accounts as acc_router
+        from admin.models import Account
+        ok = fail = 0
+        failed_names: list[str] = []
+        # 逐号重采积分包明细 → 写回到期快照。选号的「先用快过期的」这条
+        # 规则完全建立在这份快照上，所以它必须按自己的节奏刷新，
+        # 而不是搭在余额刷新里「顺便做」—— 余额刷新频率高、开销敏感，
+        # 一旦为了省钱把 with_expiry 关掉，调度依据就悄悄归零了
+        # （这个 bug 真实发生过）。
+        for a in db.query(Account).filter(Account.status == "active").all():
+            try:
+                sess = None
+                try:
+                    from admin.backend import AccountSession
+                    sess = AccountSession(a.auth_json)
+                    packages = sess.fetch_credit_details()
+                    a.auth_json = sess.updated_json()
+                finally:
+                    if sess is not None:
+                        try:
+                            sess.close()
+                        except Exception:
+                            pass
+                acc_router._sync_credit_snapshot(a, packages)
+                ok += 1
+            except Exception:
+                fail += 1
+                failed_names.append(_account_label(a))
+            db.commit()
+        rows = db.query(Account).filter(Account.status == "active").all()
+        expiring_soon = sum(int(a.credits_expiring_soon or 0) for a in rows)
+        soonest = min((a.credits_soonest_expire_at for a in rows
+                       if a.credits_soonest_expire_at), default=None)
+        soonest_txt = ""
+        if soonest is not None:
+            import datetime as _dt
+            left = (soonest - _dt.datetime.utcnow()).total_seconds() / 86400.0
+            soonest_txt = (f"，最近一个 {int(left)} 天后到期" if left >= 1
+                           else "，最近一个 24 小时内到期")
+        return {"task": task, "ok": True, "refreshed": ok, "failed": fail,
+                "credits_expiring_soon": expiring_soon,
+                "failed_accounts": failed_names[:10],
+                "summary": (f"已更新 {ok} 个账号的积分到期快照"
+                            + (f"，7 天内到期 {expiring_soon} 积分" if expiring_soon else "")
+                            + soonest_txt
                             + (f"，{fail} 个失败：{'、'.join(failed_names[:3])}"
                                if fail else ""))}
     if task == "sync_models":
@@ -129,6 +180,24 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
 _KEEPALIVE_DEAD_THRESHOLD = 3
 
 
+#: 刷新/鉴权返回里代表「服务端会话已被删除」的标记 —— OAuth 标准语义，属**终态**。
+#: 与文案式的 12153 抖动区分开：命中这些就没有重试价值，应立即禁用并提示重登。
+_AUTH_DEAD_MARKERS = (
+    "invalid_grant",
+    "offline user session not found",
+    "refresh token failed",
+    "session not found",
+)
+
+
+def _access_token_of(sess) -> str:
+    """从 AccountSession 里取当前 accessToken（用于判断是否真的刷新了）。"""
+    try:
+        return ((sess.cm._session().get("auth") or {}).get("accessToken")) or ""
+    except Exception:
+        return ""
+
+
 def run_keepalive_tokens(db) -> dict:
     """定时刷新所有活跃账号的 token，保持登录态存活（「保活」）。
 
@@ -142,11 +211,18 @@ def run_keepalive_tokens(db) -> dict:
     实现要点（对齐参考实现，也贴合上游真实行为）：
       * **串行 + 节流**：账号之间有 KEEPALIVE_ACCOUNT_GAP 秒间隔。批量并发地
         刷新 token 是一个很明显的机器特征，节流后与真人逐个使用的节奏接近。
-      * **只刷新不调用**：仅走 token 刷新路径（`get_headers()`），不发起对话。
-        这样不消耗积分、不产生对话记录，纯保活。
-      * **12153 连续计数**：刷新抛「session 已死」时累加 `session_dead_fails`；
-        达到阈值才禁用账号。一次就禁用会造成误杀（上游抖动/并发刷新都会临时触发）。
-      * **成功清零**：刷新成功即把 `session_dead_fails` 归零。
+      * **只刷新不调用**：不发起对话、不消耗积分、不产生对话记录。
+      * **必须真探测（本次修复的关键）**：原来只调 `get_headers()`，
+        它只在**本地** expiresAt 临近时才刷新 token —— 而登录态被上游**吊销**时，
+        本地 expiresAt 可能还有几千小时（实测 6231h），于是保活一路报「存活 ✓」，
+        真实请求却 401。这就是「7 个号失效了但保活说全好」的根因。
+        现在改为调一次最轻的鉴权接口（取模型列表）：它不发对话、零积分消耗，
+        但能真实回答「这个登录态上游还认不认」。
+      * **区分 401 与网络抖动**：401/403 是登录态废了（终态）；
+        HttpClient Stream error 之类只是抖动，**绝不能**计入失效计数，
+        否则一次网络抖动会把好号累计到阈值然后误禁。
+      * **连续计数后禁用**：失效达阈值才禁用，避免单次抖动误杀。
+      * **成功清零**：探测成功即把 `session_dead_fails` 归零。
 
     返回结果摘要，写入 schedules.last_result 供后台查看。
     """
@@ -163,6 +239,7 @@ def run_keepalive_tokens(db) -> dict:
     refreshed = 0
     dead_disabled = 0
     failed = 0
+    dead_ids: list[int] = []        # 本次判定为「登录态失效」的账号
     errors: list[str] = []
 
     for idx, a in enumerate(accounts):
@@ -172,39 +249,84 @@ def run_keepalive_tokens(db) -> dict:
         sess = None
         try:
             sess = AccountSession(a.auth_json)
-            before = getattr(sess, "token", None)
-            headers = sess.get_headers()  # 内部按需触发 token 刷新
-            after = getattr(sess, "token", None)
+            before = _access_token_of(sess)
+            # **强制刷新**，而不是 `get_headers()`（后者只在本地 expiresAt 临近时才刷）。
+            #
+            # 这是本事故里最容易被忽略的一层：这些号的 expiresAt 写着 2027 年，
+            # 于是 `get_headers()` 一直认为「还早」，永远不刷新 ——
+            # 保活每天都报「成功 N/N、refreshed=0」，**实际上一个 token 都没动过**。
+            # 而上游的 offline session 会因为长期没有刷新活动而失效，
+            # 最终变成 `invalid_grant: Offline user session not found`。
+            #
+            # 官方客户端正是**按 24h 固定节奏刷新**（见 10.8.1），并不看是否临近过期。
+            # 我们的「每晚一次」只要真的去刷，节奏就与官方一致。
+            sess.cm._refresh()
+            after = _access_token_of(sess)
             if after and after != before:
                 refreshed += 1
-            del headers
+            # **真探测**：本地 expiresAt 不可信（登录态被吊销时它仍可能是
+            # 几千小时之后），只有打一次上游才能确认。
+            sess.fetch_models()
+            # **回写刷新后的凭证**。原实现漏了这一步：刷新出来的新 token 只存在
+            # 临时文件里，`close()` 一删就没了，库里仍是旧 token ——
+            # 等于「刷新了但白刷」，下次请求还得从头再来（或直接失败）。
+            a.auth_json = sess.updated_json()
             ok += 1
-            # 刷新成功 → 清零 session-dead 连续计数
+            # 探测成功 → 清零失效连续计数
             if a.session_dead_fails:
                 a.session_dead_fails = 0
             a.last_err_at = None
+            a.last_err_msg = ""
             db.commit()
         except Exception as e:
             msg = str(e)
-            from admin.routers.proxy import _classify_error
-            kind = _classify_error(0, msg)
-            if kind in ("session_dead", "transport"):
-                # 「刷新失败」基本等价于登录态可能已失效，但必须连续计数后才禁用
+            from admin.routers.proxy import _classify_error, _extract_http_status
+            # 从异常文本里抠出真实状态码再分类。
+            # 传 0 会把 401 归成 transport（网络抖动），于是失效号永远不被发现
+            # ——这正是「7 个号失效、保活却报全好」的最后一环。
+            http_status = _extract_http_status(msg)
+            kind = _classify_error(http_status, msg)
+            # 只有「上游明确说登录态无效」才计入失效：401/403（session_dead）、
+            # 账号级授权故障（account_fault）。**transport 不算** —— 那是网络抖动，
+            # 把它计入会让一次抖动累积到阈值、把健康号误禁（老实现就有这个毛病）。
+            if kind in ("session_dead", "account_fault"):
+                dead_ids.append(a.id)
                 a.session_dead_fails = (a.session_dead_fails or 0) + 1
                 a.cool_kind = "session_dead"
                 a.last_err_at = datetime.utcnow()
-                a.last_err_msg = (msg or "keepalive failed")[:255]
-                if a.session_dead_fails >= _KEEPALIVE_DEAD_THRESHOLD:
+                # 权威判定：登录态被上游**明确拒绝**，重试多少次都一样 → 立即禁用。
+                #
+                # 两种都算权威：
+                #   * HTTP 401/403；
+                #   * 刷新接口返回的 `invalid_grant` /
+                #     `Offline user session not found` —— 这是 OAuth 标准里
+                #     「该会话已在服务端被删除」的语义，属于**终态**，
+                #     与「文案式 12153 抖动」完全不同（实测那 7 个号正是这个）。
+                authoritative = (http_status in (401, 403)
+                                 or any(m in msg.lower() for m in _AUTH_DEAD_MARKERS))
+                threshold = 1 if authoritative else _KEEPALIVE_DEAD_THRESHOLD
+                if authoritative:
+                    a.last_err_msg = (
+                        f"登录态被上游拒绝（HTTP {http_status}），需重新登录：{msg[:150]}"
+                    )[:255]
+                else:
+                    a.last_err_msg = (msg or "keepalive 探测失败")[:255]
+                if a.session_dead_fails >= threshold:
                     a.status = "disabled"
+                    a.cool_until = None
+                    a.breaker_until = None
+                    a.degrade_until = None
                     dead_disabled += 1
                 db.commit()
                 failed += 1
                 if len(errors) < 5:
-                    errors.append(f"#{a.id}: {msg[:120]}")
+                    errors.append(f"#{a.id}: 登录态失效（{kind}"
+                                  f"{'，HTTP ' + str(http_status) if authoritative else ''}）")
             else:
+                # 网络/未知失败：只记不罚，绝不动计数与状态
                 failed += 1
                 if len(errors) < 5:
-                    errors.append(f"#{a.id}: {msg[:120]}")
+                    errors.append(f"#{a.id}: {kind} {msg[:90]}")
         finally:
             if sess is not None:
                 try:
@@ -212,16 +334,20 @@ def run_keepalive_tokens(db) -> dict:
                 except Exception:
                     pass
 
+    # 只有「真失效」才值得告警；纯网络失败不该给人「号废了」的错觉
     summary = f"保活成功 {ok}/{total}"
     if refreshed:
         summary += f"，其中 {refreshed} 个刷新了 token"
-    if dead_disabled:
-        summary += f"，{dead_disabled} 个登录态失效已禁用"
-    if failed and not dead_disabled:
-        summary += f"，{failed} 个失败"
+    if dead_ids:
+        summary += (f"，**{len(dead_ids)} 个登录态已失效**"
+                    f"（{'、'.join('#' + str(i) for i in dead_ids[:5])}"
+                    f"{' 等' if len(dead_ids) > 5 else ''}，"
+                    f"{dead_disabled} 个已自动禁用，其余待人工重登）")
+    if failed and not dead_ids:
+        summary += f"，{failed} 个网络失败（不改状态）"
     return {"task": "keepalive_tokens", "ok": True, "total": total,
             "alive": ok, "refreshed": refreshed, "failed": failed,
-            "disabled": dead_disabled, "errors": errors,
+            "disabled": dead_disabled, "dead_ids": dead_ids, "errors": errors,
             "summary": summary}
 
 
@@ -502,10 +628,28 @@ def _checkin_summary(r: dict) -> str:
 
 
 def _run_one(s: Schedule, db, now: datetime):
-    # 保活是「指定整点执行」而非「每 N 分钟执行」：若本轮不是保活整点，
-    # 只顺延到下一个整点、不执行。这样避免每天多刷几次 token（无谓的请求
-    # 本身就是可被观测的机器行为）。
-    if s.task == "keepalive_tokens" and not _is_keepalive_hour(now):
+    # 保活是「每天在指定本地整点执行」而非「每 N 分钟执行」。
+    #
+    # 原实现（有 bug，已修）：`if not _is_keepalive_hour(now): 顺延到下一天; return`
+    # —— 只要那一小时里服务不在线（重启 / 部署 / 夜里没人用），
+    # 下次轮询就把 next_run_at 顺延到**第二天**，而 last_run_at 不动。
+    # 结果是「每天 22 点刚好错过 → 永远错过」：实测 09-20 之后连续 18 天
+    # 一次都没跑过，而界面上每天都显示「下次 22:00」，看起来完全正常。
+    # 这直接导致 7 个账号登录态失效后无人发现。
+    #
+    # 现在的语义是**到期窗口**：只要现在距上次成功执行已超过一个周期
+    # （或超过了今天的计划时刻），就补跑一次。这样错过整点只会「晚跑」，
+    # 不会「永远不跑」。
+    if s.task == "keepalive_tokens":
+        if not _keepalive_due(s, now):
+            # 还没到今天的计划时刻 → 顺延到下一个计划时刻（正常等待）
+            s.next_run_at = _next_keepalive_at(now)
+            db.commit()
+            return
+        # 到期（可能已经迟到）→ 照常执行；执行后把 next 排到下一个计划时刻
+        result = run_task(s.task, db, s)
+        s.last_result = _dump_result(result)
+        s.last_run_at = now
         s.next_run_at = _next_keepalive_at(now)
         db.commit()
         return
@@ -516,10 +660,7 @@ def _run_one(s: Schedule, db, now: datetime):
         s.last_result = json.dumps(
             {"ok": False, "error": _short_error(e)}, ensure_ascii=False)[:2000]
     s.last_run_at = now
-    if s.task == "keepalive_tokens":
-        s.next_run_at = _next_keepalive_at(now)
-    else:
-        s.next_run_at = now + timedelta(minutes=s.interval_minutes or 60)
+    s.next_run_at = now + timedelta(minutes=s.interval_minutes or 60)
     db.commit()
 
 
@@ -552,6 +693,11 @@ def seed_defaults(db):
         now = datetime.utcnow()
         db.add(Schedule(name="整点刷新平台总积分", task="refresh_balances",
                         interval_minutes=60, enabled=1, next_run_at=now))
+        # 积分到期快照：选号「先用快过期的」完全依赖它，单独成一个任务，
+        # 免得被人为了省开销把 with_expiry 关掉时连调度依据一起搞丢。
+        db.add(Schedule(name="每 2 小时更新积分到期快照", task="refresh_credits",
+                        interval_minutes=120, enabled=1,
+                        next_run_at=now + timedelta(minutes=3)))
         db.add(Schedule(name="每日同步模型列表", task="sync_models",
                         interval_minutes=1440, enabled=1, next_run_at=now))
         db.add(Schedule(name="每日签到领取积分", task="daily_checkin",
@@ -561,6 +707,25 @@ def seed_defaults(db):
         db.add(Schedule(name="每日自动做成长任务", task="run_growth_tasks",
                         interval_minutes=1440, enabled=1,
                         next_run_at=now + timedelta(seconds=_GROWTH_MIN_AFTER_REFRESH)))
+        db.commit()
+
+
+def ensure_credit_schedule(db):
+    """补齐「积分到期快照」定时任务（幂等）。
+
+    为什么必须有独立任务：选号策略里的「先用快过期的」读的是
+    `accounts.credits_expiring_soon` / `credits_soonest_expire_at`。
+    这两个值只在积分快照刷新时更新 —— 如果没人刷，它们会一直停在旧值，
+    表现就是「明明有积分快到期了，调度却一直不动」，而且**没有任何报错**，
+    属于最难发现的一类故障。默认每 2 小时一次：官方积分按自然日推进，
+    2 小时的粒度足够让「7 天内到期」提前被看见，又不会把上游打得太密。
+    """
+    row = db.query(Schedule).filter(Schedule.task == "refresh_credits").first()
+    if row is None:
+        now = datetime.utcnow()
+        db.add(Schedule(name="每 2 小时更新积分到期快照", task="refresh_credits",
+                        interval_minutes=120, enabled=1,
+                        next_run_at=now + timedelta(minutes=3)))
         db.commit()
 
 
@@ -631,8 +796,8 @@ def ensure_keepalive_schedule(db):
     ADMIN_KEEPALIVE_HOURS 配置多个小时（逗号分隔），或设
     ADMIN_KEEPALIVE_ENABLED=0 关闭。
 
-    这里把 interval_minutes 设为 1440（每天一次），并且只在当前小时命中
-    列表时才真正执行 —— 见 _is_keepalive_hour。
+    这里把 interval_minutes 设为 1440（每天一次），并且只在到期时才真正执行
+    —— 见 _keepalive_due。
     """
     if not settings.KEEPALIVE_ENABLED:
         # 显式关闭：若存在则禁用（不删除，保留后台可见与手动触发能力）
@@ -649,26 +814,108 @@ def ensure_keepalive_schedule(db):
         db.add(Schedule(name="每日 token 保活刷新", task="keepalive_tokens",
                         interval_minutes=1440, enabled=1, next_run_at=target))
         db.commit()
+        return
+
+    # ---- 存量记录自愈 ----
+    # 旧版本用 **UTC** 的小时来计算 next_run_at，与现在的「本地时区」语义不符
+    # （22 点被算成 UTC 22:00 = 北京次日 06:00）。部署新版后，库里那条旧记录
+    # 会把下次执行排到「按新语义看还早得很」的时刻 —— 逻辑修好了却仍然不跑。
+    # 更糟的是它可能已经逾期很久（本次故障就是 18 天）。
+    #
+    # 这里只做「**向前**对齐」：
+    #   * 已经到期（含逾期很久）→ 把 next_run_at 设为现在，立即补跑；
+    #   * 尚未到期但存量时间明显偏晚 → 拉回按新语义算出的计划时刻；
+    #   * 绝不往后推 —— 推迟本来就该执行的保活是危险的。
+    now = datetime.utcnow()
+    want = now if _keepalive_due(row, now) else _next_keepalive_at(now)
+    if row.next_run_at is None or row.next_run_at > want:
+        if row.next_run_at is None or row.next_run_at - want > timedelta(minutes=1):
+            row.next_run_at = want
+            db.commit()
+
+
+def _local_now() -> datetime:
+    """当前**本地**时间。
+
+    为什么需要：调度器其它地方统一用 `datetime.utcnow()`（库里存的也是 UTC），
+    但 `ADMIN_KEEPALIVE_HOURS=22` 在配置注释里明确写的是「本地时区」，
+    用户理解就是「晚上 10 点」。原实现直接拿 UTC 的 hour 去比，
+    于是 22 点实际打到了 **UTC 22:00 = 北京次日 06:00** —— 用户设的夜间保活
+    变成了清晨，与他「在没人用号的时候做」的意图不符。
+    """
+    return datetime.now()
+
+
+def _tz_offset() -> timedelta:
+    """本地时间与 UTC 的偏移（`本地 - UTC`）。
+
+    **必须用同一瞬间的两个时钟来求**：`datetime.now()`（本地）与
+    `datetime.utcnow()`（UTC）。早先的写法是
+    `_local_now() - now`（把「真实当前时间」减去**调用方传入的时间**），
+    两者不是同一瞬间 —— 于是偏移量变成了「真实时刻 − 参数」这个毫无意义的差值，
+    判断自然全错（测试里表现为「已过计划时刻却算成没到」）。
+    """
+    return datetime.now() - datetime.utcnow()
 
 
 def _next_keepalive_at(now: datetime) -> datetime:
-    """返回下一个保活整点时刻。"""
-    from datetime import time as _time
+    """返回下一个保活整点时刻（**UTC naive**，与 Schedule.next_run_at 同口径）。
+
+    `now` 传入的是 UTC naive（调度循环统一用 utcnow）。
+    这里把 now 换成本地时间判断「今天该跑的小时过没过」，再换回 UTC 存储。
+    """
+    tz = _tz_offset()
+    now_local = now + tz
     hours = sorted(set(h for h in settings.KEEPALIVE_HOURS if 0 <= h <= 23)) or [22]
     for h in hours:
-        cand = now.replace(hour=h, minute=0, second=0, microsecond=0)
-        if cand > now:
-            return cand
-    # 今天的都过了 → 明天第一个整点
-    return (now + timedelta(days=1)).replace(
+        cand_local = now_local.replace(hour=h, minute=0, second=0, microsecond=0)
+        if cand_local > now_local:
+            return cand_local - tz
+    nxt = (now_local + timedelta(days=1)).replace(
         hour=hours[0], minute=0, second=0, microsecond=0)
+    return nxt - tz
+
+
+def _keepalive_due(s: "Schedule", now: datetime) -> bool:
+    """保活现在是否该跑。
+
+    判据（任一成立即到期）：
+
+    1. 已到/已过**今天**的计划时刻，且今天还没成功跑过
+       —— 覆盖「22:00 那一刻服务不在线，23:30 才起来」的情况；
+    2. 距上次成功执行已超过 `周期 + 宽限`（24h + 6h）
+       —— 兜底「计划时刻总是错过」的极端情况，保证至少一天跑一次。
+
+    这样错过整点只会**晚跑**，不会像原实现那样无限顺延。
+    """
+    tz = _tz_offset()
+    now_local = now + tz
+    hours = sorted(set(h for h in settings.KEEPALIVE_HOURS if 0 <= h <= 23)) or [22]
+    today_plan_local = now_local.replace(
+        hour=hours[0], minute=0, second=0, microsecond=0)
+    today_plan = today_plan_local - tz          # 换回 UTC 比较
+
+    last = s.last_run_at
+    if last is not None:
+        # 今天已经跑过（且是在今天的计划时刻之后跑的）→ 不重复
+        if last >= today_plan:
+            return False
+        # 兜底：距上次超过 周期+宽限，即使计划时刻算错也要补一次
+        grace = timedelta(hours=6)
+        if now - last >= timedelta(days=1) + grace:
+            return True
+    # 计划时刻已到（今天还没跑）→ 到期
+    return now >= today_plan
 
 
 def _is_keepalive_hour(now: datetime) -> bool:
-    """当前小时是否属于保活整点（容差 1 小时：调度器每 15s 轮询，
-    若上一轮因数据库短暂不可用被跳过，下一轮仍应补上）。"""
+    """当前（本地）小时是否命中保活整点。
+
+    .. deprecated:: 判断「该不该跑」请用 `_keepalive_due`。
+       保留本函数只因它出现在既有调用方与文档里；语义已改为**本地时区**。
+    """
     hours = set(settings.KEEPALIVE_HOURS)
-    return now.hour in hours or (now.hour - 1) in hours
+    return _local_now().hour in hours
 
 
 _scheduler_lock = threading.Lock()
@@ -692,6 +939,7 @@ def start_scheduler():
         ensure_daily_checkin(db)
         ensure_growth_schedules(db)
         ensure_keepalive_schedule(db)
+        ensure_credit_schedule(db)
         db.close()
     except Exception:
         pass

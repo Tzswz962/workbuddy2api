@@ -149,8 +149,35 @@ def init_db() -> bool:
         _ensure_column("accounts", "degrade_until", "DATETIME", "NULL")
         _ensure_column("accounts", "credits_expiring", "INT", "DEFAULT 0")
 
+        # 迁移：积分到期口径字段（见 admin/credits.py）。
+        # credits_expiring 的历史窗口是 30 天，而官方与参考实现按 7 天判定
+        # 「快过期」；这两件事必须分开存，否则调度用的窗口会和界面显示的对不上。
+        _ensure_column("accounts", "credits_expiring_soon", "INT", "DEFAULT 0")
+        _ensure_column("accounts", "credits_soonest_expire_at", "DATETIME", "NULL")
+        _ensure_column("accounts", "credits_evergreen", "INT", "DEFAULT 0")
+        _ensure_column("accounts", "credits_expired", "INT", "DEFAULT 0")
+        _ensure_column("accounts", "credits_snapshot", "TEXT", "NULL")
+        _ensure_column("accounts", "credits_synced_at", "DATETIME", "NULL")
+
         # 迁移：api_keys 加 group_id 列（绑定模型分组；0=不限制）
         _ensure_column("api_keys", "group_id", "INT", "DEFAULT 0")
+
+        # 迁移：使用记录/日志的查询索引。
+        #
+        # 为什么必须在迁移里建而不是只靠 create_all：老库的表已经存在，
+        # create_all 对已存在的表**什么都不做**，索引永远建不上，
+        # 「按账号查询慢」的根因就一直在。这里显式补齐（幂等）。
+        #
+        # 这几个复合索引的列序都是「等值过滤列 + created_at」：
+        # 过滤完直接沿索引倒序取前 N 行，省掉回表排序 ——
+        # 这正是使用记录分页从「先全表过滤再 filesort」变成「索引扫描」的关键。
+        _ensure_index("usage_logs", "ix_usage_logs_created_id", ("created_at", "id"))
+        _ensure_index("usage_logs", "ix_usage_logs_account_created", ("account_id", "created_at"))
+        _ensure_index("usage_logs", "ix_usage_logs_key_created", ("api_key_id", "created_at"))
+        _ensure_index("usage_logs", "ix_usage_logs_model_created", ("model", "created_at"))
+        _ensure_index("usage_logs", "ix_usage_logs_error_created", ("error_kind", "created_at"))
+        _ensure_index("accounts", "ix_accounts_status", ("status",))
+        _ensure_index("accounts", "ix_accounts_uid", ("uid",))
 
         # 迁移：创建 system_settings / schedules 表（create_all 已处理，这里仅兜底）
 
@@ -185,3 +212,40 @@ def _ensure_column(table: str, col: str, col_type: str, default: str = ""):
                 conn.commit()
     except Exception:
         pass  # 非 MySQL 或权限不足时静默跳过
+
+
+def _ensure_index(table: str, index: str, columns: tuple[str, ...]) -> bool:
+    """确保复合索引存在（幂等）。返回 True 表示本次新建。
+
+    为什么必须显式建：`Base.metadata.create_all()` 对**已存在**的表不做任何事，
+    所以老库上新加的索引永远不会生效 —— 这正是「按账号查询使用记录很慢」
+    在升级后依然慢的原因。这里走 INFORMATION_SCHEMA 判断后 `CREATE INDEX`。
+
+    索引名与列名都经 `_safe_ident` 白名单校验（只允许字母数字下划线），
+    杜绝拼接注入；无法执行的方言（如 SQLite）静默跳过，不影响启动。
+    """
+    if not columns:
+        return False
+    try:
+        with engine.connect() as conn:
+            exists = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS "
+                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:tbl AND INDEX_NAME=:idx"
+                ),
+                {"tbl": table, "idx": index},
+            ).scalar() or 0
+            if exists:
+                return False
+            cols = ", ".join(f"`{_safe_ident(c)}`" for c in columns)
+            conn.execute(
+                text(f"CREATE INDEX `{_safe_ident(index)}` "
+                     f"ON `{_safe_ident(table)}` ({cols})")
+            )
+            conn.commit()
+            logger.info("已创建索引 %s(%s)", index, ",".join(columns))
+            return True
+    except Exception as e:
+        # 权限不足 / 方言不支持 / 并发建索引冲突：都不该让服务启动失败
+        logger.warning("创建索引 %s 失败（不影响启动）：%s", index, e)
+        return False

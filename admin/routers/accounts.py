@@ -237,41 +237,79 @@ def _apply_meta(acc: Account, auth_json: str, profile: dict | None = None,
 
 
 #: 「快过期积分」的判定窗口（天）。
-#: 官方赠送/任务获得的积分按批过期（实测多为 30 天），不用就作废，
-#: 所以把这个窗口内的剩余额度单独统计出来，作为选号权重与展示依据。
+#:
+#: 官方套餐页与参考实现都以 **7 天** 为界（官方把 7 天内到期的额度标成橙色）。
+#: 这里保留 30 天的 `EXPIRING_SOON_DAYS` 供**旧字段** `credits_expiring` 使用
+#: （向后兼容，三因子加权的历史行为不变），而新的严格口径一律读
+#: `admin.credits.EXPIRING_SOON_DAYS`（=7）。
 EXPIRING_SOON_DAYS = 30
 
 
-def _compute_expiring(packages: list[dict]) -> int:
-    """从积分明细里算出「即将过期」的剩余额度合计。
+def _compute_expiring(normalized: list[dict]) -> int:
+    """从**归一化**积分明细里算出「即将过期」的剩余额度合计（30 天旧口径）。
 
-    判定：`deduction_end_ts > 0`（有过期时间）且距今不超过
-    EXPIRING_SOON_DAYS 天，把这些包的 `remain` 加起来。
-    永久有效的包（`deduction_end_ts == 0`）不计入。
+    .. deprecated:: 新代码请直接用 `credits.summarize_account` 的
+       `expiring_soon_remaining`（7 天窗口）。本函数只用于维护历史字段
+       `credits_expiring`，让三因子加权策略的行为与升级前保持一致。
+
+    判定：有过期时间（`expire_at` 非空）且距今不超过 EXPIRING_SOON_DAYS 天，
+    把这些包的剩余额度加起来。长期有效的包不计入。
     """
     now_ms = datetime.now(timezone.utc).timestamp() * 1000
     horizon_ms = EXPIRING_SOON_DAYS * 86400 * 1000
     total = 0
-    for p in packages or []:
+    for p in normalized or []:
         try:
-            ts = int(p.get("deduction_end_ts") or 0)
+            ts = int(p.get("expire_at") or 0)
         except Exception:
             continue
         if ts <= 0:
             continue
         left = ts - now_ms
         if 0 <= left <= horizon_ms:
-            total += int(p.get("remain") or 0)
+            total += int(p.get("remaining") or 0)
     return total
+
+
+def _sync_credit_snapshot(acc: Account, packages: list[dict]) -> dict:
+    """把逐包积分明细归一化后写回账号记录，并返回账号级到期汇总。
+
+    这是「快到期的先用完」这条调度的**唯一数据来源**：写回后，
+    选号路径只需要读 `acc.credits_expiring_soon` / `acc.credits_soonest_expire_at`
+    两个列，不必为每个候选账号发一次上游请求。
+
+    为什么把明细也存下来（`credits_snapshot`）：参考实现能做出「最近快到期的
+    积分包」列表并支持「查看全部积分包」，靠的就是手里有逐包数据。原先只存一个
+    汇总数字，界面就只能显示一个总额，用户没法判断到底哪个包先作废。
+    """
+    from admin import credits as credit_rules
+
+    now = credit_rules.now_ms()
+    normalized = credit_rules.normalize_packages(packages, now)
+    summary = credit_rules.summarize_account(normalized, now)
+
+    acc.credits_expiring = _compute_expiring(normalized)      # 旧口径，保持兼容
+    acc.credits_expiring_soon = int(summary["expiring_soon_remaining"])
+    acc.credits_evergreen = int(
+        sum(r["remaining"] for r in normalized
+            if r["remaining"] > 0 and not r["expire_at"]))
+    acc.credits_expired = int(summary["expired_remaining"])
+    acc.credits_soonest_expire_at = credit_rules.as_datetime(summary["soonest_expire_at"])
+    acc.credits_snapshot = json.dumps(
+        {**summary,
+         "resources": [{k: v for k, v in r.items()} for r in normalized]},
+        ensure_ascii=False)
+    acc.credits_synced_at = datetime.utcnow()
+    return summary
 
 
 def _refresh_balance(acc: Account, with_expiry: bool = False) -> bool:
     """刷新账号余额。
 
     Args:
-        with_expiry: 是否同时统计「快过期积分」。
+        with_expiry: 是否同时同步**积分包到期快照**（剩余额度按包拆分）。
             需要多打一次 `fetch_credit_details`（约 0.4s），
-            所以只在整点定时任务里开 —— 高频路径（登录后收尾）不开，
+            所以只在整点定时任务与「刷新全部」里开 —— 高频路径（登录后收尾）不开，
             但**至少会保留上一次的值**，不会因为不刷新就被清零。
     """
     try:
@@ -281,8 +319,7 @@ def _refresh_balance(acc: Account, with_expiry: bool = False) -> bool:
             acc.balance_remain = int(bal.get("remain", 0) or 0)
             if with_expiry:
                 try:
-                    acc.credits_expiring = _compute_expiring(
-                        sess.fetch_credit_details())
+                    _sync_credit_snapshot(acc, sess.fetch_credit_details())
                 except Exception:
                     pass  # 拿不到就保留旧值（不写 0 覆盖）
             acc.auth_json = sess.updated_json()  # 回写可能刷新的 token
@@ -290,6 +327,68 @@ def _refresh_balance(acc: Account, with_expiry: bool = False) -> bool:
         return True
     except Exception:
         return False
+
+
+def _credit_fields(a: Account) -> dict:
+    """账号记录里的积分到期字段 → 前端可直接用的结构。
+
+    `credits_snapshot` 存的是完整汇总 JSON（含逐包明细）。解析失败时
+    降级为「只有汇总数字、没有明细」，绝不让一条坏数据把整个列表打挂
+    —— 列表是运维最常用的入口，宁可少显示也不要 500。
+    """
+    snap = {}
+    raw = (a.credits_snapshot or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                snap = parsed
+        except Exception:
+            snap = {}
+
+    from admin import credits as credit_rules
+
+    soonest_ms = None
+    if a.credits_soonest_expire_at:
+        soonest_ms = int(a.credits_soonest_expire_at.replace(
+            tzinfo=timezone.utc).timestamp() * 1000)
+    resources = snap.get("resources") or []
+
+    def _slim(r: dict) -> dict:
+        """只带列表展示真正用到的字段。
+
+        快照里的每个包有 ~10 个字段（含 package_name / days_left / status / used…），
+        而列表每行只画「剩余额度 + 包名 + 到期日」三样。23 个账号 × 全部包
+        （实测 590 条）会把响应从几十 KB 顶到 183 KB，且随账号数线性增长 ——
+        这正是「越用越卡」的来源。完整字段走单账号明细接口。
+        """
+        return {
+            "package_code": r.get("package_code") or "",
+            "display_name": r.get("display_name") or r.get("package_name") or "积分包",
+            "remaining": round(float(r.get("remaining") or 0), 4),
+            "total": round(float(r.get("total") or 0), 4),
+            "expire_at": r.get("expire_at"),
+            "expire_label": credit_rules.format_expire_at(r.get("expire_at")),
+            "expire_date": credit_rules.expire_date_label(r.get("expire_at")),
+            "expiring_soon": bool(r.get("expiring_soon")),
+            "expired": bool(r.get("expired")),
+        }
+
+    return {
+        "credits_expiring": int(a.credits_expiring or 0),          # 旧 30 天口径
+        "credits_expiring_soon": int(a.credits_expiring_soon or 0),  # 严格 7 天口径
+        "credits_evergreen": int(a.credits_evergreen or 0),
+        "credits_expired": int(a.credits_expired or 0),
+        "credits_soonest_expire_at": soonest_ms,
+        "credits_soonest_days_left": snap.get("soonest_days_left"),
+        "credits_synced_at": a.credits_synced_at.isoformat() if a.credits_synced_at else None,
+        "credits_package_count": int(snap.get("package_count") or 0),
+        "credits_active_package_count": int(snap.get("active_package_count") or 0),
+        # 「最近快到期的积分包」：明细已按到期升序，取前 3 个供列表行直接渲染。
+        # **不再返回全量 `credits_resources`** —— 前端从未用过它（见 index.html
+        # 的 grep：只有 credits_next_expiring 被读取），纯属响应体积负担。
+        "credits_next_expiring": [_slim(r) for r in resources[:3]],
+    }
 
 
 @router.get("")
@@ -308,6 +407,7 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
             "last_sync_at": a.last_sync_at.isoformat() if a.last_sync_at else None,
             "last_used_at": a.last_used_at.isoformat() if a.last_used_at else None,
             "created_at": a.created_at.isoformat() if a.created_at else None,
+            **_credit_fields(a),
         }
         for a in rows
     ]
@@ -317,6 +417,16 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
         "available": sum(1 for i in items if i["status"] == "active" and i["balance_remain"] > 0),
         "balance_total": sum(i["balance_total"] for i in items),
         "balance_remain": sum(i["balance_remain"] for i in items),
+        # 到期维度汇总：整池有多少额度处于「7 天内作废」的危险区
+        "credits_expiring_soon": sum(i["credits_expiring_soon"] for i in items),
+        "credits_evergreen": sum(i["credits_evergreen"] for i in items),
+        "credits_expired": sum(i["credits_expired"] for i in items),
+        "expiring_accounts": sum(
+            1 for i in items if i["status"] == "active" and i["credits_expiring_soon"] > 0),
+        "soonest_expire_at": min(
+            (i["credits_soonest_expire_at"] for i in items
+             if i["status"] == "active" and i["credits_soonest_expire_at"]),
+            default=None),
     }
     return {"items": items, "summary": summary}
 
@@ -630,32 +740,241 @@ def inject_to_client(acc_id: int, body: InjectIn, _: bool = Depends(require_admi
 
 
 @router.post("/{acc_id}/refresh")
-def refresh_account(acc_id: int, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+def refresh_account(acc_id: int, with_expiry: bool = True,
+                    _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """刷新单账号余额。
+
+    `with_expiry` 默认 **True**：单个账号的刷新通常是「我想看看这个号现在
+    到底还剩多少、哪个包要先到期」，只回一个总额等于没解决他的问题。
+    多一次上游请求（约 0.4s），换取到期快照的实时性，这个交换是值得的。
+    批量刷新走 `/credits/sync` 与定时任务，口径一致。
+    """
     acc = db.query(Account).filter(Account.id == acc_id).first()
     if not acc:
         raise HTTPException(status_code=404, detail="账号不存在")
-    ok = _refresh_balance(acc)
+    ok = _refresh_balance(acc, with_expiry=with_expiry)
     db.commit()
     if not ok:
         raise HTTPException(status_code=502, detail="刷新失败：后端调用异常（凭据/限流）")
-    return {"id": acc.id, "balance_total": acc.balance_total, "balance_remain": acc.balance_remain}
+    return {
+        "id": acc.id,
+        "balance_total": acc.balance_total,
+        "balance_remain": acc.balance_remain,
+        **_credit_fields(acc),
+    }
 
 
 @router.get("/{acc_id}/credit-details")
-def credit_details(acc_id: int, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    """获取账号积分明细（每个积分包的总量/剩余/到期时间）。"""
+def credit_details(acc_id: int, refresh: bool = False,
+                   _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """获取账号积分明细（每个积分包的总量/剩余/到期时间）。
+
+    默认**优先返回库内快照**：整点定时任务已经把逐包明细存下来了，
+    点开详情时再打一次上游纯属浪费（每个号约 0.4s，用户要等）。
+    `refresh=true`（界面上是「重新采集」）才真调上游并写回快照。
+
+    返回的 `packages` 是**归一化后**的结构：到期时间已经过
+    `resolve_expire_at` 处理（长期占位值不会被当成真实到期日），
+    剩余额度取当前周期口径，并带上 `expiring_soon` / `days_left`
+    供界面直接标色与排序。
+    """
     acc = db.query(Account).filter(Account.id == acc_id).first()
     if not acc:
         raise HTTPException(status_code=404, detail="账号不存在")
-    try:
-        with backend.AccountSession(acc.auth_json) as sess:
-            packages = sess.fetch_credit_details()
-            # 回写可能刷新的 token
-            acc.auth_json = sess.updated_json()
+
+    from admin import credits as credit_rules
+
+    def _cached() -> list[dict]:
+        raw = (acc.credits_snapshot or "").strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return []
+        return parsed.get("resources") or [] if isinstance(parsed, dict) else []
+
+    packages: list[dict] = []
+    source = "cache"
+    error = ""
+    if refresh or not _cached():
+        try:
+            with backend.AccountSession(acc.auth_json) as sess:
+                raw_packages = sess.fetch_credit_details()
+                # 回写可能刷新的 token
+                acc.auth_json = sess.updated_json()
+            _sync_credit_snapshot(acc, raw_packages)
             db.commit()
-        return {"id": acc_id, "account": acc.name, "packages": packages}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"获取积分明细失败: {e}")
+            packages = _cached()
+            source = "live"
+        except Exception as e:
+            error = str(e)
+            packages = _cached()   # 上游失败也要能把上次的快照给出去
+            source = "cache" if packages else "none"
+            if not packages:
+                raise HTTPException(status_code=502, detail=f"获取积分明细失败: {e}")
+    else:
+        packages = _cached()
+
+    summary = credit_rules.summarize_account(packages)
+    # 明细按到期升序返回 —— 与面板的「最近快到期的积分包」、以及 `packages`
+    # 的展示顺序保持一致。用 `summary["resources"]` 而不是原始 `packages`：
+    # 前者已排好序（且已排除没有剩余额度的包），后者是上游给出的顺序
+    # （实测按创建时间，与到期时间无关，直接展示会出现「10/31 排在 10/12 前面」）。
+    ordered = summary["resources"]
+    return {
+        "id": acc_id,
+        "account": acc.name,
+        "source": source,                       # live | cache
+        "error": error or None,
+        # 旧字段保留：`packages` 维持升级前的扁平结构
+        # （`name` / `total` / `remain` / `used` / `deduction_end` …）。
+        # 把它改成新结构会让既有脚本与页面静默显示空白 —— 兼容成本极低，
+        # 就不做这个破坏性变更。新代码请用下面的 `credits.resources`。
+        "packages": [_legacy_package(r) for r in ordered],
+        # 新增：账号级到期汇总 + 参考实现同口径的字段命名
+        "credits": {
+            "ok": True,
+            "account_id": acc_id,
+            "account_name": acc.name,
+            "updated_at": (
+                int(acc.credits_synced_at.replace(tzinfo=timezone.utc).timestamp() * 1000)
+                if acc.credits_synced_at else None),
+            "total_capacity": summary["total_capacity"],
+            "total_remaining": summary["total_remaining"],
+            "expiring_soon_remaining": summary["expiring_soon_remaining"],
+            "expired_remaining": summary["expired_remaining"],
+            "soonest_expire_at": summary["soonest_expire_at"],
+            "soonest_days_left": summary["soonest_days_left"],
+            "expiring_soon": summary["expiring_soon"],
+            "expired": summary["expired"],
+            "expiring_soon_days": credit_rules.EXPIRING_SOON_DAYS,
+            #: 只含**仍有剩余**的包（已用完的不必占版面），按到期升序
+            "resources": [
+                {
+                    "packageCode": r["package_code"],
+                    "packageName": r["package_name"],
+                    "displayName": r["display_name"],
+                    "total": r["total"],
+                    "remaining": r["remaining"],
+                    "used": r["used"],
+                    "status": r["status"],
+                    "expireAt": r["expire_at"],
+                    "expireLabel": credit_rules.format_expire_at(r["expire_at"]),
+                    "expireDate": credit_rules.expire_date_label(r["expire_at"]),
+                    "expired": r["expired"],
+                    "expiringSoon": r["expiring_soon"],
+                    "daysLeft": r["days_left"],
+                }
+                for r in ordered
+            ],
+            #: 全部包（含已用完），也按到期升序 —— 「积分明细」弹窗要看全量
+            "all_resources": [
+                {
+                    "packageCode": r["package_code"],
+                    "packageName": r["package_name"],
+                    "displayName": r["display_name"],
+                    "total": r["total"],
+                    "remaining": r["remaining"],
+                    "used": r["used"],
+                    "status": r["status"],
+                    "expireAt": r["expire_at"],
+                    "expireLabel": credit_rules.format_expire_at(r["expire_at"]),
+                    "expireDate": credit_rules.expire_date_label(r["expire_at"]),
+                    "expired": r["expired"],
+                    "expiringSoon": r["expiring_soon"],
+                    "daysLeft": r["days_left"],
+                }
+                for r in sorted(
+                    packages,
+                    key=lambda x: (x.get("expire_at") is None,
+                                   x.get("expire_at") or 0))
+            ],
+        },
+    }
+
+
+def _legacy_package(r: dict) -> dict:
+    """归一化资源包 → 升级前的扁平结构（`packages` 字段的兼容层）。
+
+    升级前 `fetch_credit_details` 就在这里把上游字段改名成
+    `name` / `total` / `remain` / `deduction_end` 等；现在改名搬到
+    `admin/credits.py`（口径判断的唯一点），但**对外结构保持不变** ——
+    既有页面与脚本都在读它，改结构会让它们静默显示空白。
+    """
+    expire_at = r.get("expire_at")
+    return {
+        "name": r.get("display_name") or r.get("package_name") or "未命名",
+        "total": r.get("total") or 0,
+        "remain": r.get("remaining") or 0,
+        "used": r.get("used") or 0,
+        # 账号层累积剩余（CapacityRemain）：与「当前周期剩余」是两个口径，
+        # 这里没有等价值就不假造，给 0 比给一个错数字诚实。
+        "account_remain": 0,
+        "account_used": 0,
+        "cycle_start": "",
+        "cycle_end": _ms_to_str(expire_at),
+        "deduction_end_ts": expire_at or 0,
+        "deduction_end": _ms_to_str(expire_at),
+        "status": r.get("status"),
+        "package_code": r.get("package_code") or "",
+    }
+
+
+def _ms_to_str(ts) -> str:
+    if not ts:
+        return ""
+    try:
+        return datetime.fromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, ValueError, TypeError):
+        return ""
+
+
+@router.post("/credits/sync")
+def sync_credits(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """立即重新采集**全部活跃账号**的积分到期快照。
+
+    与整点定时任务 `refresh_credits` 走同一份实现（`_sync_credit_snapshot`），
+    避免「手动刷新」和「自动刷新」出现两套口径这种经典问题。
+
+    串行 + 每号间隔，与保活/批量任务的节流规则一致：批量并发请求上游
+    本身就是很明显的机器特征。账号多时耗时会到几十秒，故前端应按后台任务
+    的节奏处理（这里返回逐号结果，供前端展示进度）。
+    """
+    from admin.config import settings
+
+    accounts = (db.query(Account).filter(Account.status == "active")
+                .order_by(Account.id.asc()).all())
+    ok = 0
+    failed = 0
+    detail: list[dict] = []
+    for idx, a in enumerate(accounts):
+        if idx and settings.KEEPALIVE_ACCOUNT_GAP > 0:
+            time.sleep(settings.KEEPALIVE_ACCOUNT_GAP)
+        try:
+            with backend.AccountSession(a.auth_json) as sess:
+                packages = sess.fetch_credit_details()
+                a.auth_json = sess.updated_json()
+            summary = _sync_credit_snapshot(a, packages)
+            ok += 1
+            detail.append({
+                "id": a.id, "account": a.name, "ok": True,
+                "expiring_soon": int(summary["expiring_soon_remaining"]),
+                "soonest_days_left": summary["soonest_days_left"],
+                "packages": summary["active_package_count"],
+            })
+        except Exception as e:
+            failed += 1
+            detail.append({"id": a.id, "account": a.name, "ok": False,
+                           "error": str(e)[:160]})
+        db.commit()
+
+    expiring = sum(int(a.credits_expiring_soon or 0) for a in accounts)
+    return {
+        "ok": True, "total": len(accounts), "refreshed": ok, "failed": failed,
+        "credits_expiring_soon": expiring,
+        "detail": detail,
+    }
 
 
 @router.get("/{acc_id}/request-usage")

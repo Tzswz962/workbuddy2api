@@ -384,12 +384,78 @@ def _weight(credits: int, expiring: int, max_credits: int,
     return w
 
 
+# ---------------------------------------------------------------------------
+# 到期紧迫度：所有策略的**首要**排序依据
+# ---------------------------------------------------------------------------
+#: 「快到期的先用完」的紧迫度分级。数值越小越先被选中。
+#:
+#: 为什么把它做成独立于策略的**首要**键，而不是只塞进 weighted 的权重里：
+#: 权重是概率倾斜 —— 一个 7 天内到期的号只是「更容易」被选中，而不是
+#: 「一定先被选中」。只要池子里还有余额更高或更闲置的号，抽签就可能
+#: 一直不选它，直到那批额度作废。用户的原话是「还是优先把快到期的账号
+#: 积分先用完才行」—— 这要求的是**严格优先**，不是倾向。
+#:
+#: 分级定义（与 admin/credits.urgency_rank 保持同一口径）：
+#:   0 = 有 7 天内到期的剩余额度（再不烧就作废）
+#:   1 = 有过期时间但还早（自然形成「离到期近的先走」）
+#:   2 = 全部长期有效（没有作废风险，只用它兜底）
+EXPIRY_RANK_SOON = 0
+EXPIRY_RANK_DATED = 1
+EXPIRY_RANK_EVERGREEN = 2
+
+#: 判定「快过期」的窗口（天）。与 admin.credits.EXPIRING_SOON_DAYS 同值，
+#: 官方套餐页按 7 天把额度标成橙色。这里不 import credits 是为了让 pool
+#: 保持「纯内存、零依赖」的定位（它被高频路径调用，不该牵出 ORM/网络层）。
+EXPIRING_SOON_DAYS = 7
+
+
+def expiry_key(account: Any, now: datetime | None = None) -> tuple:
+    """账号的到期紧迫度排序键：**越小越先被使用**。
+
+    读取 `credits_expiring_soon` / `credits_soonest_expire_at` 两个列
+    （由 `refresh_credits` 定时任务写入，见 admin/credits.py）。
+
+    缺数据时的兜底：老库升级后这两个列可能还是空的。此时
+    `credits_expiring_soon` 为 0 且 `credits_soonest_expire_at` 为 None，
+    会被判成「长期有效」（rank 2）—— 排在最后。这是**刻意**的选择：
+    把未知当成「没有作废风险」，最坏只是晚一点用它，
+    而把未知当成「快过期了」会让调度去烧一个可能根本不紧急的号，
+    反而耽误真正快过期的额度。
+    """
+    now = now or _now_utc()
+    expiring_soon = int(getattr(account, "credits_expiring_soon", 0) or 0)
+    if expiring_soon > 0:
+        soonest = _as_utc(getattr(account, "credits_soonest_expire_at", None))
+        ts = soonest.timestamp() if soonest is not None else float("inf")
+        return (EXPIRY_RANK_SOON, ts)
+
+    soonest = _as_utc(getattr(account, "credits_soonest_expire_at", None))
+    if soonest is not None:
+        return (EXPIRY_RANK_DATED, soonest.timestamp())
+    return (EXPIRY_RANK_EVERGREEN, float("inf"))
+
+
+def sort_by_expiry(cands: list[Any], *, now: datetime | None = None,
+                   secondary=None) -> list[Any]:
+    """按「到期紧迫度优先」排序候选账号，同级内用 `secondary` 决出先后。
+
+    `secondary` 是 `key(account) -> tuple`；缺省时同级内按余额降序
+    （余额多先走，让单个号的额度更可能被用干净）。
+    """
+    now = now or _now_utc()
+    if secondary is None:
+        def secondary(a):
+            return (-int(getattr(a, "balance_remain", 0) or 0),)
+    return sorted(cands, key=lambda a: (expiry_key(a, now), secondary(a)))
+
+
 def weighted_pick(cands: list[dict], *, rand: random.Random | None = None,
                   now: datetime | None = None) -> dict | None:
     """三因子加权随机选号：先取 Top-N 短名单，再在名单内加权抽签。
 
     每个候选是 dict，需含：
         uid / credits / credits_expiring / last_used_at
+        可选 expiry_rank（最小到期紧迫度键）—— 见 `pick_with_expiry_priority`
 
     为什么是「Top-N + 抽签」而不是直接按权重排序取第一：纯排序会让余额最高的号
     承担几乎全部流量（热点），且余额一旦回落就骤停；抽签是**概率倾斜**而非硬排序，
@@ -435,6 +501,36 @@ def weighted_pick(cands: list[dict], *, rand: random.Random | None = None,
         if r < acc:
             return c
     return weighted[-1][0]
+
+
+def pick_with_expiry_priority(cands: list[dict], *,
+                              rand: random.Random | None = None,
+                              now: datetime | None = None) -> dict | None:
+    """先按到期紧迫度严格分级，再在**同级内**做三因子加权抽签。
+
+    这是 `weighted` 策略的正确形态。原实现只在权重里给快过期积分加 8 分，
+    属于概率倾斜：池子里只要还有余额更高/更闲置的号，抽签就可能一直不选
+    那个快过期的号，直到额度作废。这里把「紧迫度」提成硬性分组 ——
+    只要存在 7 天内到期的号，就在这批号里抽签，绝不会退回到其他号，
+    因此「先用快过期的」从倾向变成了保证。
+
+    每个候选 dict 需额外含 `expiry_rank`（`expiry_key(...)` 的结果）。
+    缺省时全部判为「长期有效」，退化成原来的纯权重行为（向后兼容）。
+    """
+    if not cands:
+        return None
+    now = now or _now_utc()
+    best_rank = min(_rank_of(c) for c in cands)
+    tier = [c for c in cands if _rank_of(c) == best_rank]
+    return weighted_pick(tier, rand=rand, now=now)
+
+
+def _rank_of(cand: dict) -> tuple:
+    """候选的紧迫度键；缺省视为「长期有效」（排在最后）。"""
+    key = cand.get("expiry_rank")
+    if isinstance(key, tuple) and key:
+        return key
+    return (EXPIRY_RANK_EVERGREEN, float("inf"))
 
 
 # ---------------------------------------------------------------------------

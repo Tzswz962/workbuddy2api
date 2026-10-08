@@ -101,16 +101,21 @@ class Settings:
     # 腾讯 CodeBuddy/WorkBuddy 后端通过 X-IDE-Name 头识别客户端，默认 "WorkBuddy"。
     UPSTREAM_CLIENT_NAME = os.getenv("ADMIN_UPSTREAM_CLIENT_NAME", "WorkBuddy")
 
-    # 账号选择策略：
-    #   oldest   最老录入优先（**默认**）—— 先用完老账号额度，避免积分过期作废
+    # 账号选择策略。
+    #
+    # **所有策略都先按「积分到期紧迫度」硬分组**（7 天内到期的号一定先用完，
+    # 见 admin/pool.py 的 expiry_key / admin/routers/proxy.py 的 _select_account），
+    # 这里的取值只决定**同一紧迫度档位内部**的先后：
+    #   expiring 到期最近优先（**默认**）—— 严格「先用快过期的」
+    #   oldest   最老录入优先 —— 到期数据缺失时的次优选择
     #   remain   剩余最多优先
     #   lru      最久未用优先
     #   weighted 三因子加权随机（余额 ×10 + 快过期 ×8 + 闲置补偿）
     #
-    # 默认从 remain 改成 oldest：官方赠送积分**会过期作废**，老号离到期最近。
-    # 原来按余额最多选，会把流量持续压在新号上，老号的积分散在池子里等过期
-    # —— 用户的原话是「积分都快过期了为啥不先用」。
-    ACCOUNT_SELECT = os.getenv("ADMIN_ACCOUNT_SELECT", "oldest")
+    # 默认从 oldest 改成 expiring：oldest 只是「老号离到期近」这个**相关代理指标**，
+    # 真正要的是「离到期近」。现在有了逐包到期快照（credits_soonest_expire_at），
+    # 可以直接用真实到期时间排序，不必再靠录入时间猜。
+    ACCOUNT_SELECT = os.getenv("ADMIN_ACCOUNT_SELECT", "expiring")
 
     # ---------- 开发 / 测试辅助工具 ----------
     #: 逆向产物（客户端源码）管理：后台一键拆包 app.asar、手动指定安装目录。

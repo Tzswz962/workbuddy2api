@@ -265,8 +265,19 @@ class AccountSession:
         """获取积分明细（每个积分包的总量/剩余/到期时间）。
 
         对应截图中的「版本基础用量」「权益赠送包」等条目。
-        剩余额度使用 CycleCapacityRemain（当前周期剩余），与官方界面「累积剩余」对齐；
-        CapacityRemain 仅作为账号层级总剩余保留在字段 account_remain 中供参考。
+
+        **原样返回上游字段**，不做改名、不做取值决策：
+        上游用 `CycleCapacityRemainPrecise`（字符串小数）与
+        `CycleCapacityRemain`（整数）两套字段表达同一语义，
+        到底该信哪个、`DeductionEndTime`（可能是 2034/2049 的占位值）
+        与 `CycleEndTime` 谁是真实到期时间 —— 这些口径判断全部收拢在
+        `admin/credits.py::resource_summary`，本方法只负责「把数据取回来」。
+
+        为什么必须这样分层：这里一旦把字段改名成 `remain`/`deduction_end`，
+        口径判断就被锁死在取值现场了 —— 而 2034 占位值这个问题正是
+        「在取值现场只看 DeductionEndTime」造成的。原来这里还做了一层
+        改名，导致 `admin/credits.py` 按上游原名读取时**一个字段都匹配不上**，
+        所有包都被判成「无到期时间 / 剩余 0」，调度依据静默失效。
         """
         data = self.cm._request_backend("POST", "/v2/billing/meter/get-user-resource", {})
         resp = data.get("data", {}).get("Response", {}).get("Data", {}) or {}
@@ -274,27 +285,7 @@ class AccountSession:
         for a in resp.get("Accounts") or []:
             if a.get("CapacityUnit") != "credits":
                 continue
-            # CycleEndTime = 当前周期结束时间（如 "2026-09-30 23:59:59"）
-            # DeductionEndTime = 绝对到期时间戳（毫秒），0 表示永不过期
-            # ExpiredTime = 已过期时间（通常为空串，表示未过期）
-            cycle_end = a.get("CycleEndTime") or ""
-            deduction_end_ts = a.get("DeductionEndTime") or 0
-            packages.append({
-                "name": a.get("PackageName") or a.get("Name") or "未命名",
-                "total": a.get("CapacitySize") or 0,
-                # 真实可用额度以当前周期剩余为准（体验版用完时 CapacityRemain 仍可能为 500）
-                "remain": a.get("CycleCapacityRemain") or 0,
-                "used": a.get("CycleCapacityUsed") or 0,
-                "account_remain": a.get("CapacityRemain") or 0,
-                "account_used": a.get("CapacityUsed") or 0,
-                "cycle_start": a.get("CycleStartTime") or "",
-                "cycle_end": cycle_end,
-                "deduction_end_ts": deduction_end_ts,
-                "deduction_end": datetime.fromtimestamp(deduction_end_ts / 1000).strftime("%Y-%m-%d %H:%M:%S")
-                    if isinstance(deduction_end_ts, (int, float)) and deduction_end_ts > 0 else "",
-                "status": a.get("Status"),
-                "package_code": a.get("PackageCode") or "",
-            })
+            packages.append(a)
         return packages
 
     def fetch_request_usage(self, start_time: str, end_time: str, page_num: int = 1, page_size: int = 10) -> dict:

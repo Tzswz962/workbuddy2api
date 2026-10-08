@@ -1,7 +1,7 @@
 """ORM 模型：账号、API Key、用量日志。"""
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Float, Integer, String, Text
+from sqlalchemy import Column, DateTime, Float, Index, Integer, String, Text
 
 from admin.db import Base
 
@@ -10,6 +10,13 @@ class Account(Base):
     """一个 WorkBuddy / CodeBuddy 登录态（.info 凭据）。"""
 
     __tablename__ = "accounts"
+    # 选号热路径索引：每次代理请求都要按 status + 余额 + 冷却扫描候选池。
+    # 号池通常只有几十行，但 idx_status 让「活跃账号」这条永不消失的过滤
+    # 不必全表扫，冷启动与批量任务下更稳。
+    __table_args__ = (
+        Index("ix_accounts_status", "status"),
+        Index("ix_accounts_uid", "uid"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(120), nullable=False, default="")
@@ -42,6 +49,23 @@ class Account(Base):
     degrade_until = Column(DateTime, nullable=True)
     #: 快过期积分（供三因子权重的「快过期先用」项）。
     credits_expiring = Column(Integer, default=0)
+    # ---- 积分到期口径（详见 admin/credits.py）----------------------------
+    #: 7 天内到期的剩余额度合计。与 credits_expiring 的区别：后者是历史字段，
+    #: 窗口口径曾为 30 天；本列严格按 EXPIRING_SOON_DAYS(=7) 统计，
+    #: 是「再不烧就作废」的那部分，也是选号的首要依据。
+    credits_expiring_soon = Column(Integer, default=0)
+    #: 所有**还有剩余**的积分包里最早的到期时间（真实到期，非占位值）。
+    #: 为空表示手里全是长期有效额度（没有作废风险）。
+    credits_soonest_expire_at = Column(DateTime, nullable=True)
+    #: 长期有效（无到期时间）的剩余额度合计。
+    credits_evergreen = Column(Integer, default=0)
+    #: 已过期但账面仍有剩余的额度（上游扣减延迟时出现），仅供对账。
+    credits_expired = Column(Integer, default=0)
+    #: 逐包快照明细（JSON 文本，按到期升序）。存库而不是每次现查，
+    #: 是为了让「最近快到期的积分包」这类展示与统计不必对上游逐号发请求。
+    credits_snapshot = Column(Text, default="")
+    #: 快照采集时间，用于展示「N 分钟前更新」并判断数据是否可信。
+    credits_synced_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -126,6 +150,22 @@ class UsageLog(Base):
     """
 
     __tablename__ = "usage_logs"
+    # 索引说明（都是为「使用记录 / 日志」的筛选与排序服务的）：
+    #   ix_usage_logs_created_id  —— 覆盖「按时间倒序分页」这条**永不消失**的主查询。
+    #       原来是 PRIMARY(id) 倒序扫：日志一多，`ORDER BY id DESC LIMIT 20`
+    #       在有 where 条件时仍要走全表再排序；有了 (created_at, id) 复合索引，
+    #       时间范围过滤 + 倒序取前 N 条能直接在索引上完成，回表只取 20 行。
+    #   ix_usage_logs_account_created —— 「按账号查询」的专用索引（本次新增需求）。
+    #       账号维度是排查「某个号今天花了多少」最常用的入口，
+    #       单列 account_id 索引仍要排序，复合索引把过滤 + 排序一次做完。
+    #   ix_usage_logs_key_created / ix_usage_logs_model_created 同理，覆盖按 Key/模型筛选。
+    __table_args__ = (
+        Index("ix_usage_logs_created_id", "created_at", "id"),
+        Index("ix_usage_logs_account_created", "account_id", "created_at"),
+        Index("ix_usage_logs_key_created", "api_key_id", "created_at"),
+        Index("ix_usage_logs_model_created", "model", "created_at"),
+        Index("ix_usage_logs_error_created", "error_kind", "created_at"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     api_key_id = Column(Integer, nullable=False, default=0)
